@@ -252,23 +252,17 @@ async function ensureAndSwitchWorkspace(path: string): Promise<void> {
 }
 
 /**
- * Find and click the workspace button in the dsh sidebar to switch to it.
+ * Find and click the workspace row in the dsh sidebar to switch to it.
+ * Sidebar workspace rows are div[role="treeitem"] whose title span text
+ * matches the workspace title. CSS module hash class names are unstable
+ * across builds, so role + text is the stable selector.
  */
 function switchToWorkspaceInSidebar(ws: WorkspaceItem): void {
-  // dsh sidebar workspace buttons contain the workspace title as text
-  const buttons = document.querySelectorAll<HTMLElement>('.pXSMma_workspace, [class*="workspace"]')
-  for (const btn of buttons) {
-    const text = (btn.textContent ?? '').trim()
-    if (text === ws.title) {
-      btn.click()
-      return
-    }
-  }
-  // Fallback: try by workspaceId or path in data attributes
-  const all = document.querySelectorAll<HTMLElement>('[data-workspace-id], [data-path]')
-  for (const el of all) {
-    if (el.getAttribute('data-workspace-id') === ws.workspaceId || el.getAttribute('data-path') === ws.path) {
-      el.click()
+  const rows = document.querySelectorAll<HTMLElement>('[role="treeitem"]')
+  for (const row of rows) {
+    const text = (row.textContent ?? '').trim()
+    if (text === ws.title || text.startsWith(ws.title)) {
+      row.click()
       return
     }
   }
@@ -330,10 +324,23 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     return
   }
 
-  // 2. Detect current workspace path to decide which repo expands by default
+  // 2. Detect current workspace path to decide which repo expands by default.
+  // The workspace chip button carries a stable aria-label (zh/en) and its
+  // text content is the current workspace title.
   const wsItems = await listWorkspaces().catch(() => [] as WorkspaceItem[])
-  const wsBtn = document.querySelector<HTMLElement>('.pXSMma_workspace')
-  const currentName = (wsBtn?.textContent ?? '').trim()
+  let currentName = ''
+  for (const label of WORKSPACE_CHIP_LABELS) {
+    const wsBtn = document.querySelector<HTMLElement>(
+      `button[aria-haspopup="menu"][aria-label="${label}"]`,
+    )
+    if (wsBtn) {
+      // The chip's visible label span holds the workspace title; the button
+      // text also includes the aria-label text, so strip it.
+      const labelSpan = wsBtn.querySelector('span')
+      currentName = (labelSpan?.textContent ?? wsBtn.textContent ?? '').trim()
+      break
+    }
+  }
   const currentWs = wsItems.find(it => it.title === currentName) ?? null
   // The repo whose root contains the current workspace path is expanded by default
   const currentRepoRoot = currentWs
@@ -521,13 +528,29 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
 
 const INJECT_MARKER = 'data-dsh-worktree-btn'
 
-/** Find the Workspace Write trigger button's parent span in the composer. */
+/**
+ * Workspace chip button aria-labels (zh/en). The chip is rendered by
+ * WorkspaceChip in dsh-client-ui-conversation with aria-haspopup="menu"
+ * and one of these labels, both stable across builds unlike CSS module
+ * hash class names.
+ */
+const WORKSPACE_CHIP_LABELS = ['选择工作区', 'Choose workspace']
+
+/**
+ * Find the workspace chip button in the hero row. The chip carries
+ * aria-haspopup="menu" and an aria-label matching one of the known
+ * workspace-picker translations. Returns the button's nearest wrapper
+ * (a span or div) so the Worktree button inserts beside the chip, not
+ * inside it.
+ */
 function findWorkspaceWriteAnchor(): HTMLElement | null {
-  const trigger = document.querySelector<HTMLElement>('.Sh0Q9G_trigger')
-  if (!trigger) return null
-  // The trigger is wrapped in a span._root_19372_1; insert after that span
-  const span = trigger.closest('span')
-  return span ?? trigger
+  for (const label of WORKSPACE_CHIP_LABELS) {
+    const btn = document.querySelector<HTMLElement>(
+      `button[aria-haspopup="menu"][aria-label="${label}"]`,
+    )
+    if (btn) return btn.closest('span') ?? btn
+  }
+  return null
 }
 
 /** Inject the "Worktree" button to the right of the Workspace Write button. */
