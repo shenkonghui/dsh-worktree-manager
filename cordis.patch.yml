@@ -1,0 +1,9 @@
+# Bundle patch for dsh-worktree-manager.
+# Inserts the host-side plugin that registers HTTP routes under
+# /plugins/dsh-worktree-manager/api/* for listing, creating, and removing git
+# worktrees. The client-modules plugin discovers this package's dsh.client
+# declaration and automatically serves the browser bundle
+# (lib/client/index.js) at boot — no separate client row is needed.
+- insert:
+    - id: worktree-manager
+      name: 'dsh-worktree-manager'
