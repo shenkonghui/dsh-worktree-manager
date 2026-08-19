@@ -211,17 +211,18 @@ async function detectGitRepoPath(): Promise<string | null> {
 // ---- workspace RPC helpers ----
 
 /**
- * Ensure a workspace exists for the given path.
- * If the path is already registered as a workspace, do nothing.
- * Otherwise, create it via workspace.create RPC.
+ * Check if a workspace exists for the given path.
+ * Returns the workspace item if found, null otherwise.
  */
-async function ensureWorkspaceForWorktree(path: string): Promise<void> {
-  // Check if the path is already a workspace
+async function findWorkspace(path: string): Promise<WorkspaceItem | null> {
   const items = await listWorkspaces().catch(() => [] as WorkspaceItem[])
-  const exists = items.some(it => it.path === path)
-  if (exists) return
+  return items.find(it => it.path === path) ?? null
+}
 
-  // Create new workspace
+/**
+ * Create a workspace for the given path via workspace.create RPC.
+ */
+async function createWorkspace(path: string): Promise<void> {
   const res = await fetch('/api/workspace.create', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -234,6 +235,48 @@ async function ensureWorkspaceForWorktree(path: string): Promise<void> {
   })
   const json = await res.json()
   if (!res.ok) throw new Error(json?.result?.error?.message ?? `HTTP ${res.status}`)
+}
+
+/**
+ * Ensure a workspace exists for the given path (create if missing),
+ * then switch to it by clicking the corresponding sidebar item.
+ */
+async function ensureAndSwitchWorkspace(path: string): Promise<void> {
+  // Check if workspace already exists
+  let ws = await findWorkspace(path)
+  // Create if missing
+  if (!ws) {
+    await createWorkspace(path)
+    // Re-fetch to get the new workspace item
+    ws = await findWorkspace(path)
+  }
+  if (!ws) return
+
+  // Click the workspace in the sidebar to switch
+  switchToWorkspaceInSidebar(ws)
+}
+
+/**
+ * Find and click the workspace button in the dsh sidebar to switch to it.
+ */
+function switchToWorkspaceInSidebar(ws: WorkspaceItem): void {
+  // dsh sidebar workspace buttons contain the workspace title as text
+  const buttons = document.querySelectorAll<HTMLElement>('.pXSMma_workspace, [class*="workspace"]')
+  for (const btn of buttons) {
+    const text = (btn.textContent ?? '').trim()
+    if (text === ws.title) {
+      btn.click()
+      return
+    }
+  }
+  // Fallback: try by workspaceId or path in data attributes
+  const all = document.querySelectorAll<HTMLElement>('[data-workspace-id], [data-path]')
+  for (const el of all) {
+    if (el.getAttribute('data-workspace-id') === ws.workspaceId || el.getAttribute('data-path') === ws.path) {
+      el.click()
+      return
+    }
+  }
 }
 
 // ---- Dropdown menu ----
@@ -363,7 +406,7 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
         e.stopPropagation()
         item.setAttribute('disabled', 'disabled')
         try {
-          await ensureWorkspaceForWorktree(wt.path)
+          await ensureAndSwitchWorkspace(wt.path)
           closeDropdown()
         } catch (err) {
           item.removeAttribute('disabled')
@@ -398,7 +441,7 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
         branch,
         newBranch: true,
       }) as CreateResponse
-      await ensureWorkspaceForWorktree(result.worktree.path)
+      await ensureAndSwitchWorkspace(result.worktree.path)
       closeDropdown()
     } catch (err) {
       createBtn.removeAttribute('disabled')
