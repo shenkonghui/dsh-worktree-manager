@@ -111,14 +111,33 @@ async function apiGet<T>(action: string, params: Record<string, string>): Promis
 
 // ---- Grouping logic ----
 
-/** One worktree group with its sessions. */
-interface WorktreeGroup {
+/** One worktree subgroup with its sessions, nested under a repo group. */
+interface WorktreeSubGroup {
   /** Display label (worktree directory basename). */
   label: string
   /** Full worktree path (for tooltip). */
   path: string
   /** Sessions whose workspace lives inside this worktree. */
   sessions: SessionSummary[]
+}
+
+/** One repository group: a project root with its worktree subgroups. */
+interface RepoGroupNode {
+  /** Git repository root path (identity key). */
+  repoRoot: string
+  /** Display name for the repository (from /api/repos). */
+  repoName: string
+  /** Worktree subgroups under this repo, sorted by label. */
+  worktrees: WorktreeSubGroup[]
+  /** Total session count across all worktrees in this repo. */
+  totalSessions: number
+}
+
+/** Top-level group tree: repo groups plus an optional ungrouped bucket. */
+interface GroupTree {
+  repos: RepoGroupNode[]
+  /** Sessions whose workspace is not inside any git worktree. */
+  ungrouped: SessionSummary[]
 }
 
 /** UNGROUPED_KEY for sessions whose workspace is not inside any git worktree. */
@@ -131,72 +150,91 @@ function basename(p: string): string {
 }
 
 /**
- * Derive worktree groups from sessions, workspaces, and repo/worktree data.
+ * Derive a two-level group tree from sessions, workspaces, and repo/worktree
+ * data.
  *
  * Each workspace is mapped to the git worktree whose path is the longest
- * prefix of the workspace path. Sessions inherit their workspace's worktree.
- * Sessions whose workspace has no worktree (or no workspace at all) fall into
- * the ungrouped bucket.
+ * prefix of the workspace path, and to the repo that owns that worktree.
+ * Sessions inherit their workspace's worktree and repo. Sessions whose
+ * workspace has no worktree (or no workspace at all) fall into the ungrouped
+ * bucket.
  */
-function deriveWorktreeGroups(
+function deriveGroupTree(
   sessions: SessionListState,
   workspaces: readonly WorkspaceItem[],
   archived: readonly string[],
   repos: readonly RepoGroup[],
   worktreesByRepo: ReadonlyMap<string, WorktreeInfo[]>,
-): WorktreeGroup[] {
+): GroupTree {
   const archivedSet = new Set(archived)
 
-  // Build a flat list of (worktreePath, repoName) pairs sorted by path length
-  // descending so the longest-prefix match wins.
-  const allWorktrees: { path: string; label: string }[] = []
+  // Build a flat list of (worktreePath, label, repoRoot) sorted by path
+  // length descending so the longest-prefix match wins.
+  const allWorktrees: { path: string; label: string; repoRoot: string }[] = []
   for (const repo of repos) {
     const wts = worktreesByRepo.get(repo.root) ?? []
     for (const wt of wts) {
       if (wt.bare) continue
-      allWorktrees.push({ path: wt.path, label: basename(wt.path) })
+      allWorktrees.push({ path: wt.path, label: basename(wt.path), repoRoot: repo.root })
     }
   }
   allWorktrees.sort((a, b) => b.path.length - a.path.length)
 
-  /** Find the worktree path that contains the given directory. */
-  const findWorktree = (dir: string): { path: string; label: string } | undefined =>
+  /** Find the worktree that contains the given directory. */
+  const findWorktree = (dir: string): { path: string; label: string; repoRoot: string } | undefined =>
     allWorktrees.find(wt => dir === wt.path || dir.startsWith(wt.path + '/'))
 
-  // Map each workspace to a worktree path.
-  const wsToWorktree = new Map<string, { path: string; label: string } | undefined>()
+  /** Check whether a session should be shown. */
+  const shouldShow = (id: string, summary: SessionSummary): boolean => {
+    if (archivedSet.has(id)) return false
+    if (summary.origin === 'subagent') return false
+    if (summary.blank && id !== sessions.current) return false
+    return true
+  }
+
+  // Map each workspace to its worktree (and repo).
+  const wsToWorktree = new Map<string, { path: string; label: string; repoRoot: string } | undefined>()
   for (const ws of workspaces) {
     wsToWorktree.set(ws.workspaceId, findWorktree(ws.path))
   }
 
-  // Group sessions by their workspace's worktree (or ungrouped).
-  const groupsMap = new Map<string, WorktreeGroup>()
-  const getGroup = (key: string, label: string, path: string): WorktreeGroup => {
-    let g = groupsMap.get(key)
-    if (g === undefined) {
-      g = { label, path, sessions: [] }
-      groupsMap.set(key, g)
+  // Build repo → worktreePath → sessions map.
+  const repoMap = new Map<string, { name: string; worktrees: Map<string, WorktreeSubGroup> }>()
+  const getRepo = (root: string, name: string) => {
+    let r = repoMap.get(root)
+    if (r === undefined) {
+      r = { name, worktrees: new Map() }
+      repoMap.set(root, r)
     }
-    return g
+    return r
+  }
+  const getWorktreeSub = (repoRoot: string, repoName: string, wtPath: string, wtLabel: string): WorktreeSubGroup => {
+    const repo = getRepo(repoRoot, repoName)
+    let wg = repo.worktrees.get(wtPath)
+    if (wg === undefined) {
+      wg = { label: wtLabel, path: wtPath, sessions: [] }
+      repo.worktrees.set(wtPath, wg)
+    }
+    return wg
   }
 
-  // Collect sessions from workspace accounts.
+  const ungrouped: SessionSummary[] = []
   const accounted = new Set<string>()
+
+  // Collect sessions from workspace accounts.
   for (const ws of workspaces) {
     const wt = wsToWorktree.get(ws.workspaceId)
-    const key = wt?.path ?? UNGROUPED_KEY
-    const label = wt?.label ?? ''
-    const path = wt?.path ?? ''
-    const group = getGroup(key, label, path)
     for (const id of ws.sessionIds) {
       if (accounted.has(id)) continue
       const summary = sessions.byId[id]
       if (summary === undefined) continue
       accounted.add(id)
-      if (archivedSet.has(id)) continue
-      if (summary.origin === 'subagent') continue
-      if (summary.blank && id !== sessions.current) continue
-      group.sessions.push(summary)
+      if (!shouldShow(id, summary)) continue
+      if (wt !== undefined) {
+        getWorktreeSub(wt.repoRoot, '', wt.path, wt.label).sessions.push(summary)
+      } else {
+        ungrouped.push(summary)
+      }
     }
   }
 
@@ -205,30 +243,41 @@ function deriveWorktreeGroups(
     if (accounted.has(id)) continue
     const summary = sessions.byId[id]
     if (summary === undefined) continue
-    if (archivedSet.has(id)) continue
-    if (summary.origin === 'subagent') continue
-    if (summary.blank && id !== sessions.current) continue
+    if (!shouldShow(id, summary)) continue
     // Try to place by cwd.
     const wt = summary.cwd !== undefined ? findWorktree(summary.cwd) : undefined
-    const key = wt?.path ?? UNGROUPED_KEY
-    const label = wt?.label ?? ''
-    const path = wt?.path ?? ''
-    getGroup(key, label, path).sessions.push(summary)
+    if (wt !== undefined) {
+      getWorktreeSub(wt.repoRoot, '', wt.path, wt.label).sessions.push(summary)
+    } else {
+      ungrouped.push(summary)
+    }
   }
 
-  // Sort sessions within each group by recency (newest first).
-  for (const g of groupsMap.values()) {
-    g.sessions.sort((a, b) => b.updatedAt - a.updatedAt)
-  }
+  // Resolve repo names from the /api/repos response.
+  const repoNameByRoot = new Map<string, string>()
+  for (const repo of repos) repoNameByRoot.set(repo.root, repo.name)
 
-  // Output order: groups with a worktree first (by label), ungrouped last.
-  const groups = [...groupsMap.values()].filter(g => g.path !== '')
-  groups.sort((a, b) => a.label.localeCompare(b.label))
-  const ungrouped = groupsMap.get(UNGROUPED_KEY)
-  if (ungrouped !== undefined && ungrouped.sessions.length > 0) {
-    groups.push(ungrouped)
+  // Sort sessions within each worktree by recency (newest first).
+  // Assemble repo group nodes with sorted worktree subgroups.
+  const reposOut: RepoGroupNode[] = []
+  for (const [root, { name, worktrees }] of repoMap) {
+    const wts = [...worktrees.values()]
+    for (const wt of wts) wt.sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+    wts.sort((a, b) => a.label.localeCompare(b.label))
+    const totalSessions = wts.reduce((n, wt) => n + wt.sessions.length, 0)
+    if (totalSessions === 0) continue
+    reposOut.push({
+      repoRoot: root,
+      repoName: repoNameByRoot.get(root) ?? name ?? basename(root),
+      worktrees: wts,
+      totalSessions,
+    })
   }
-  return groups
+  reposOut.sort((a, b) => a.repoName.localeCompare(b.repoName))
+
+  ungrouped.sort((a, b) => b.updatedAt - a.updatedAt)
+
+  return { repos: reposOut, ungrouped }
 }
 
 // ---- Styles (inline; no CSS Modules build chain) ----
@@ -350,8 +399,20 @@ const panelBody: CSSProperties = {
   padding: '4px 0 12px',
 }
 
-const groupHeader: CSSProperties = {
+/** Repository-level group header: bold, primary color, with indent. */
+const repoHeader: CSSProperties = {
   margin: '8px 12px 4px',
+  fontSize: '12px',
+  fontWeight: 600,
+  lineHeight: '18px',
+  color: TOKEN('--dsw-alias-label-primary', 'inherit'),
+  userSelect: 'none',
+  cursor: 'pointer',
+}
+
+/** Worktree-level group header: nested under its repo, caption color. */
+const worktreeHeader: CSSProperties = {
+  margin: '4px 12px 2px 20px',
   fontSize: '11px',
   fontWeight: 500,
   lineHeight: '16px',
@@ -488,9 +549,9 @@ export function WorktreePanel({ wide, useWorkspaces, useSessions, openSession, t
     return () => { cancelled = true }
   }, [open])
 
-  const groups = useMemo<WorktreeGroup[]>(() => {
-    if (fetchState.phase !== 'ready') return []
-    return deriveWorktreeGroups(
+  const groupTree = useMemo<GroupTree>(() => {
+    if (fetchState.phase !== 'ready') return { repos: [], ungrouped: [] }
+    return deriveGroupTree(
       sessions,
       workspaces,
       archived,
@@ -500,23 +561,31 @@ export function WorktreePanel({ wide, useWorkspaces, useSessions, openSession, t
   }, [sessions, workspaces, archived, fetchState])
 
   const totalSessions = useMemo(
-    () => groups.reduce((n, g) => n + g.sessions.length, 0),
-    [groups],
+    () => groupTree.repos.reduce((n, r) => n + r.totalSessions, 0) + groupTree.ungrouped.length,
+    [groupTree],
   )
 
-  const filteredGroups = useMemo(() => {
+  const filteredTree = useMemo<GroupTree>(() => {
     const q = filter.trim().toLowerCase()
-    if (q === '') return groups
-    return groups
-      .map(g => ({
-        ...g,
-        sessions: g.sessions.filter(s =>
-          s.displayTitle.toLowerCase().includes(q)
-          || (s.cwd ?? '').toLowerCase().includes(q),
-        ),
+    if (q === '') return groupTree
+    const matchSession = (s: SessionSummary): boolean =>
+      s.displayTitle.toLowerCase().includes(q)
+      || (s.cwd ?? '').toLowerCase().includes(q)
+    const repos = groupTree.repos
+      .map(repo => ({
+        ...repo,
+        worktrees: repo.worktrees
+          .map(wt => ({ ...wt, sessions: wt.sessions.filter(matchSession) }))
+          .filter(wt => wt.sessions.length > 0),
       }))
-      .filter(g => g.sessions.length > 0)
-  }, [groups, filter])
+      .map(repo => ({
+        ...repo,
+        totalSessions: repo.worktrees.reduce((n, wt) => n + wt.sessions.length, 0),
+      }))
+      .filter(repo => repo.totalSessions > 0)
+    const ungrouped = groupTree.ungrouped.filter(matchSession)
+    return { repos, ungrouped }
+  }, [groupTree, filter])
 
   const toggleGroup = (key: string): void => {
     setCollapsed(prev => {
@@ -574,61 +643,122 @@ export function WorktreePanel({ wide, useWorkspaces, useSessions, openSession, t
             {fetchState.phase === 'error' && (
               <p style={errorNote} role="alert">{t('panel.error', { message: fetchState.message })}</p>
             )}
-            {fetchState.phase === 'ready' && filteredGroups.length === 0 && (
+            {fetchState.phase === 'ready' && filteredTree.repos.length === 0 && filteredTree.ungrouped.length === 0 && (
               <p style={note}>
                 {filter.trim() !== '' ? t('panel.search.noMatches') : t('panel.empty')}
               </p>
             )}
-            {fetchState.phase === 'ready' && filteredGroups.map((group) => {
-              const key = group.path || UNGROUPED_KEY
-              const isCollapsed = collapsed.has(key)
-              const label = group.path === '' ? t('panel.ungrouped') : group.label
+            {fetchState.phase === 'ready' && filteredTree.repos.map((repo) => {
+              const repoKey = repo.repoRoot
+              const repoCollapsed = collapsed.has(repoKey)
               return (
-                <div key={key}>
+                <div key={repoKey}>
                   <div
-                    style={groupHeader}
-                    onClick={() => { toggleGroup(key) }}
-                    title={group.path}
+                    style={repoHeader}
+                    onClick={() => { toggleGroup(repoKey) }}
+                    title={repo.repoRoot}
                   >
-                    <span>{isCollapsed ? '▶' : '▼'} {label}</span>
+                    <span>{repoCollapsed ? '▶' : '▼'} {repo.repoName}</span>
                     <span style={groupCount}>
-                      {t('panel.sessionCount', { n: group.sessions.length })}
+                      {t('panel.sessionCount', { n: repo.totalSessions })}
                     </span>
                   </div>
-                  {!isCollapsed && (
-                    <ul style={sessionList}>
-                      {group.sessions.map((s) => {
-                        const isCurrent = s.id === sessions.current
-                        const title = s.blank ? t('session.new') : s.displayTitle
-                        const dotColor = s.running
-                          ? TOKEN('--dsw-alias-state-success-primary', '#a6e3a1')
-                          : isCurrent
-                            ? TOKEN('--dsw-alias-state-business-primary', '#89b4fa')
-                            : TOKEN('--dsw-alias-label-caption', 'rgba(0,0,0,0.2)')
-                        return (
-                          <li key={s.id}>
-                            <button
-                              type="button"
-                              style={{
-                                ...sessionRow,
-                                ...(isCurrent ? {
-                                  background: TOKEN('--dsw-alias-interactive-bg-hover', 'rgba(0,0,0,0.05)'),
-                                } : {}),
-                              }}
-                              onClick={() => { openSession(s.id) }}
-                              title={s.cwd ?? title}
-                            >
-                              <span style={{ ...dot, background: dotColor }} />
-                              <span style={sessionTitle}>{title}</span>
-                            </button>
-                          </li>
-                        )
-                      })}
-                    </ul>
-                  )}
+                  {!repoCollapsed && repo.worktrees.map((wt) => {
+                    const wtKey = wt.path
+                    const wtCollapsed = collapsed.has(wtKey)
+                    return (
+                      <div key={wtKey}>
+                        <div
+                          style={worktreeHeader}
+                          onClick={() => { toggleGroup(wtKey) }}
+                          title={wt.path}
+                        >
+                          <span>{wtCollapsed ? '▸' : '▾'} {wt.label}</span>
+                          <span style={groupCount}>
+                            {t('panel.sessionCount', { n: wt.sessions.length })}
+                          </span>
+                        </div>
+                        {!wtCollapsed && (
+                          <ul style={sessionList}>
+                            {wt.sessions.map((s) => {
+                              const isCurrent = s.id === sessions.current
+                              const title = s.blank ? t('session.new') : s.displayTitle
+                              const dotColor = s.running
+                                ? TOKEN('--dsw-alias-state-success-primary', '#a6e3a1')
+                                : isCurrent
+                                  ? TOKEN('--dsw-alias-state-business-primary', '#89b4fa')
+                                  : TOKEN('--dsw-alias-label-caption', 'rgba(0,0,0,0.2)')
+                              return (
+                                <li key={s.id}>
+                                  <button
+                                    type="button"
+                                    style={{
+                                      ...sessionRow,
+                                      ...(isCurrent ? {
+                                        background: TOKEN('--dsw-alias-interactive-bg-hover', 'rgba(0,0,0,0.05)'),
+                                      } : {}),
+                                    }}
+                                    onClick={() => { openSession(s.id) }}
+                                    title={s.cwd ?? title}
+                                  >
+                                    <span style={{ ...dot, background: dotColor }} />
+                                    <span style={sessionTitle}>{title}</span>
+                                  </button>
+                                </li>
+                              )
+                            })}
+                          </ul>
+                        )}
+                      </div>
+                    )
+                  })}
                 </div>
               )
             })}
+            {fetchState.phase === 'ready' && filteredTree.ungrouped.length > 0 && (
+              <div>
+                <div
+                  style={repoHeader}
+                  onClick={() => { toggleGroup(UNGROUPED_KEY) }}
+                >
+                  <span>{collapsed.has(UNGROUPED_KEY) ? '▶' : '▼'} {t('panel.ungrouped')}</span>
+                  <span style={groupCount}>
+                    {t('panel.sessionCount', { n: filteredTree.ungrouped.length })}
+                  </span>
+                </div>
+                {!collapsed.has(UNGROUPED_KEY) && (
+                  <ul style={sessionList}>
+                    {filteredTree.ungrouped.map((s) => {
+                      const isCurrent = s.id === sessions.current
+                      const title = s.blank ? t('session.new') : s.displayTitle
+                      const dotColor = s.running
+                        ? TOKEN('--dsw-alias-state-success-primary', '#a6e3a1')
+                        : isCurrent
+                          ? TOKEN('--dsw-alias-state-business-primary', '#89b4fa')
+                          : TOKEN('--dsw-alias-label-caption', 'rgba(0,0,0,0.2)')
+                      return (
+                        <li key={s.id}>
+                          <button
+                            type="button"
+                            style={{
+                              ...sessionRow,
+                              ...(isCurrent ? {
+                                background: TOKEN('--dsw-alias-interactive-bg-hover', 'rgba(0,0,0,0.05)'),
+                              } : {}),
+                            }}
+                            onClick={() => { openSession(s.id) }}
+                            title={s.cwd ?? title}
+                          >
+                            <span style={{ ...dot, background: dotColor }} />
+                            <span style={sessionTitle}>{title}</span>
+                          </button>
+                        </li>
+                      )
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
           </div>
         </section>
       )}
