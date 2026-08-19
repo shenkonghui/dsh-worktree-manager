@@ -13,9 +13,10 @@ Git worktrees let you have multiple working directories connected to the same re
 The dsh task start window has a workspace picker for selecting a directory to work in, but it doesn't know about git worktrees. This plugin bridges that gap by:
 
 1. Adding a "Git Worktree" button to the workspace picker area
-2. Providing a dialog to list existing worktrees for any repository
-3. Allowing creation of new worktrees (new branch or existing branch)
-4. Auto-registering selected/created worktrees as dsh workspaces so they appear in the picker
+2. Scanning all registered dsh workspaces and grouping those inside a git repository by their shared repository root
+3. Providing a dropdown that lists worktrees grouped by repository, with per-repo collapsible sections and a cross-repo search filter
+4. Allowing creation of new worktrees (new branch) with a target-repo selector
+5. Auto-registering selected/created worktrees as dsh workspaces and switching to them
 
 ## Architecture
 
@@ -28,6 +29,7 @@ A Cordis plugin that injects `ctx.webServer`, `ctx.shell`, and `ctx.workspaceReg
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/list?repoPath=<path>` | List git worktrees for a repository |
+| GET | `/api/repos` | Scan all dsh workspaces and group them by git repository root |
 | POST | `/api/create` | Create a new worktree and register it as a workspace |
 | POST | `/api/remove` | Remove a git worktree |
 | POST | `/api/branches` | List branches in a repository |
@@ -36,10 +38,13 @@ The host half uses `node:child_process` to run `git worktree` commands and `ctx.
 
 ### Client half (`src/client/index.ts`)
 
-A browser module loaded at boot (`immediately: true`). It uses a `MutationObserver` to detect when the workspace picker appears in the SPA, then injects a "Git Worktree" button. Clicking the button opens a dialog with two tabs:
+A browser module loaded at boot (`immediately: true`). It uses a `MutationObserver` to detect when the workspace picker appears in the SPA, then injects a "Git Worktree" button. Clicking the button opens a dropdown that:
 
-- **Select Worktree**: Enter a repo path, load existing worktrees, and click one to select it for development
-- **Create Worktree**: Enter a repo path, choose a branch (or create a new one), optionally specify a target path, and create + select the worktree
+- Calls `GET /api/repos` to discover all git repositories among the registered dsh workspaces
+- Concurrently loads worktrees for every discovered repository via `GET /api/list`
+- Renders worktrees grouped by repository, each section collapsible; the repository containing the current workspace expands by default
+- Provides a search box that filters worktrees across all repositories by name, branch, or path
+- Offers a create row with a target-repo selector (defaulting to the current workspace's repo) and a new-branch input
 
 The client communicates with the host through `fetch()` calls to the custom HTTP routes.
 
@@ -60,12 +65,13 @@ The harness discovers the plugin from the `dsh` manifest field and:
 ## Usage
 
 1. Start the dsh web UI
-2. In the task start window, look for the "Git Worktree" button near the workspace picker
-3. Click it to open the worktree manager dialog
-4. **To select an existing worktree**: enter the repository path, click "Load", then click a worktree in the list
-5. **To create a new worktree**: switch to the "Create Worktree" tab, enter the repo path, load branches, choose a branch (or toggle "Create a new branch"), optionally set a target path, then click "Create & Select"
+2. In the task start window, look for the "Worktree" button near the workspace picker
+3. Click it to open the worktree dropdown — it scans all registered workspaces and groups worktrees by repository
+4. **To select an existing worktree**: expand a repository section, then click a worktree to switch to it
+5. **To filter**: type in the search box to match worktrees across all repositories by name, branch, or path
+6. **To create a new worktree**: choose a target repository from the selector (defaults to the current repo), type a new branch name, and click "创建"
 
-The selected/created worktree directory is fed back into the workspace picker, and the worktree is registered as a dsh workspace so it appears in future sessions.
+The selected/created worktree directory is registered as a dsh workspace and the sidebar switches to it.
 
 ## API Reference
 
@@ -84,6 +90,26 @@ Returns:
       "bare": false,
       "locked": false,
       "prunable": false
+    }
+  ]
+}
+```
+
+### `GET /plugins/dsh-worktree-manager/api/repos`
+
+No parameters. Scans every registered dsh workspace, resolves its git repository root via `git rev-parse --git-common-dir` (so linked worktrees group under their main worktree), and returns one entry per distinct root.
+
+Returns:
+```json
+{
+  "repos": [
+    {
+      "root": "/path/to/repo",
+      "name": "repo",
+      "workspaces": [
+        { "id": "ws-uuid", "path": "/path/to/repo", "title": "repo" },
+        { "id": "ws-uuid-2", "path": "/path/to/repo-worktrees/feature", "title": "feature" }
+      ]
     }
   ]
 }

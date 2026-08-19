@@ -37,9 +37,20 @@ interface CreateResponse {
   workspaceId: string
 }
 
-interface BranchesResponse {
-  branches: string[]
-  current?: string
+interface RepoWorkspace {
+  id: string
+  path: string
+  title: string
+}
+
+interface RepoGroup {
+  root: string
+  name: string
+  workspaces: RepoWorkspace[]
+}
+
+interface ReposResponse {
+  repos: RepoGroup[]
 }
 
 // ---- API helpers ----
@@ -81,6 +92,12 @@ function el<K extends keyof HTMLElementTagNameMap>(
     node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child)
   }
   return node
+}
+
+/** Extract the final path component (trailing slashes trimmed). */
+function basename(p: string): string {
+  const parts = p.replace(/\/+$/, '').split('/')
+  return parts[parts.length - 1] || p
 }
 // ---- Styles ----
 
@@ -142,7 +159,23 @@ function injectStyles(): void {
 .dsh-wt-dropdown-btn-secondary {
   background: transparent; color: inherit;
   border: 1px solid var(--dsh-border, rgba(0,0,0,0.15));
-}`
+}
+.dsh-wt-repo-group { border-bottom: 1px solid var(--dsh-border, rgba(0,0,0,0.06)); }
+.dsh-wt-repo-group:last-child { border-bottom: none; }
+.dsh-wt-repo-header {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 12px; cursor: pointer; font-size: 12px; font-weight: 600;
+  background: var(--dsh-hover, rgba(0,0,0,0.03)); user-select: none;
+}
+.dsh-wt-repo-header:hover { background: var(--dsh-hover, rgba(0,0,0,0.06)); }
+.dsh-wt-repo-toggle { font-size: 10px; opacity: 0.5; flex: none; width: 12px; }
+.dsh-wt-repo-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsh-wt-repo-count { font-size: 10px; opacity: 0.5; flex: none; font-weight: 400; }
+.dsh-wt-repo-body { display: none; }
+.dsh-wt-repo-body.open { display: block; }
+.dsh-wt-repo-empty { padding: 8px 12px; font-size: 11px; opacity: 0.5; }
+.dsh-wt-dropdown-create select.dsh-wt-dropdown-input { flex: none; width: auto; min-width: 120px; }
+`
   document.head.appendChild(style)
 }
 
@@ -168,44 +201,6 @@ async function listWorkspaces(): Promise<WorkspaceItem[]> {
   })
   const json = await res.json()
   return json?.result?.value?.items ?? []
-}
-
-/**
- * Detect the git repo path for the current context.
- * Strategy:
- *   1. Get the current workspace name from the composer's workspace label.
- *   2. Match it to a workspace path via workspace.list.
- *   3. Try that path as a git repo (the host will walk up if needed).
- *   4. If it fails, try every other workspace path until one works.
- *   5. Return null if no workspace is a git repo.
- */
-async function detectGitRepoPath(): Promise<string | null> {
-  const items = await listWorkspaces().catch(() => [] as WorkspaceItem[])
-  if (items.length === 0) return null
-
-  // Identify the current workspace by the composer label
-  const wsBtn = document.querySelector<HTMLElement>('.pXSMma_workspace')
-  const currentName = (wsBtn?.textContent ?? '').trim()
-
-  // Sort: current workspace first, then others
-  const sorted = [...items].sort((a, b) => {
-    if (a.title === currentName) return -1
-    if (b.title === currentName) return 1
-    return 0
-  })
-
-  // Try each workspace path until one is a valid git repo
-  for (const it of sorted) {
-    try {
-      const res = await fetch(
-        `/plugins/dsh-worktree-manager/api/list?repoPath=${encodeURIComponent(it.path)}`,
-      )
-      if (res.ok) return it.path
-    } catch {
-      // continue to next
-    }
-  }
-  return null
 }
 
 // ---- workspace RPC helpers ----
@@ -315,31 +310,13 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   setTimeout(() => document.addEventListener('click', onDocClick), 0)
 
   // Loading state
-  dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '正在检测 git 仓库…' }))
+  dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '正在扫描 git 仓库…' }))
 
-  // 1. Detect git repo path from current workspace (or any workspace)
-  const wsPath = await detectGitRepoPath()
-  if (!wsPath) {
-    dropdown.innerHTML = ''
-    dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: '当前所有工作区均不是 git 仓库' }))
-    return
-  }
-
-  // 2. Load worktrees for the detected git repo
-  dropdown.innerHTML = ''
-  dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '正在加载 worktree 列表…' }))
-
-  let worktrees: WorktreeInfo[] = []
-  let branches: string[] = []
-  let currentBranch = ''
+  // 1. Fetch all discovered repositories (grouped by git common root)
+  let repos: RepoGroup[]
   try {
-    const [listRes, branchesRes] = await Promise.all([
-      apiGet('list', { repoPath: wsPath }) as Promise<ListResponse>,
-      apiPost('branches', { repoPath: wsPath }) as Promise<BranchesResponse>,
-    ])
-    worktrees = listRes.worktrees
-    branches = branchesRes.branches
-    currentBranch = branchesRes.current ?? ''
+    const reposRes = await apiGet('repos', {}) as ReposResponse
+    repos = reposRes.repos
   } catch (err) {
     dropdown.innerHTML = ''
     const msg = err instanceof Error ? err.message : String(err)
@@ -347,24 +324,61 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     return
   }
 
-  // 3. Render worktree list with search filter
-  dropdown.innerHTML = ''
-
-  // Helper: extract basename from a path
-  const basename = (p: string): string => {
-    const parts = p.replace(/\/+$/, '').split('/')
-    return parts[parts.length - 1] || p
+  if (repos.length === 0) {
+    dropdown.innerHTML = ''
+    dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: '当前所有工作区均不是 git 仓库' }))
+    return
   }
 
-  const headerText = worktrees.length > 0
-    ? `当前仓库: ${basename(wsPath)} (${worktrees.length} 个 worktree)`
-    : `当前仓库: ${basename(wsPath)} (无 worktree)`
+  // 2. Detect current workspace path to decide which repo expands by default
+  const wsItems = await listWorkspaces().catch(() => [] as WorkspaceItem[])
+  const wsBtn = document.querySelector<HTMLElement>('.pXSMma_workspace')
+  const currentName = (wsBtn?.textContent ?? '').trim()
+  const currentWs = wsItems.find(it => it.title === currentName) ?? null
+  // The repo whose root contains the current workspace path is expanded by default
+  const currentRepoRoot = currentWs
+    ? repos.find(r => currentWs.path === r.root || currentWs.path.startsWith(r.root + '/'))?.root ?? null
+    : null
+
+  // 3. Concurrently load worktrees for every discovered repo
+  dropdown.innerHTML = ''
+  dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '正在加载 worktree 列表…' }))
+
+  interface RepoWithWorktrees {
+    repo: RepoGroup
+    worktrees: WorktreeInfo[]
+    error?: string
+  }
+  const loaded: RepoWithWorktrees[] = await Promise.all(
+    repos.map(async r => {
+      try {
+        const listRes = await apiGet('list', { repoPath: r.root }) as ListResponse
+        return { repo: r, worktrees: listRes.worktrees }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        return { repo: r, worktrees: [], error: msg }
+      }
+    }),
+  )
+
+  // Stable order: current repo first, then by root path
+  loaded.sort((a, b) => {
+    if (a.repo.root === currentRepoRoot) return -1
+    if (b.repo.root === currentRepoRoot) return 1
+    return a.repo.root.localeCompare(b.repo.root)
+  })
+
+  // 4. Render grouped list with search filter
+  dropdown.innerHTML = ''
+
+  const totalWorktrees = loaded.reduce((n, g) => n + g.worktrees.length, 0)
+  const headerText = `${repos.length} 个仓库 · ${totalWorktrees} 个 worktree`
   dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-header', text: headerText }))
 
   // Search input
   const searchBox = el('input', {
     class: 'dsh-wt-dropdown-input',
-    placeholder: '筛选 worktree…',
+    placeholder: '筛选 worktree (按名称/分支/路径)…',
     style: 'width:100%;box-sizing:border-box;margin:0;border:0;border-bottom:1px solid var(--dsh-border, rgba(0,0,0,0.06));border-radius:0;padding:8px 12px;',
   })
   dropdown.appendChild(searchBox)
@@ -376,45 +390,84 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   function renderList(filter: string): void {
     listContainer.innerHTML = ''
     const lower = filter.toLowerCase()
-    const filtered = worktrees.filter(wt => {
-      if (!filter) return true
-      const name = basename(wt.path).toLowerCase()
-      const branch = (wt.branch ?? '').toLowerCase()
-      return name.includes(lower) || branch.includes(lower) || wt.path.toLowerCase().includes(lower)
-    })
+    const hasFilter = filter.length > 0
 
-    if (filtered.length === 0) {
-      listContainer.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '无匹配 worktree' }))
-      return
-    }
+    let totalShown = 0
 
-    for (const wt of filtered) {
-      const item = el('button', { class: 'dsh-wt-dropdown-item' })
-      const info = el('div', { class: 'dsh-wt-dropdown-item-info' })
-      info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-path', text: basename(wt.path), title: wt.path }))
-      const branchText = wt.branch ? wt.branch : `HEAD: ${wt.head.slice(0, 8)}`
-      info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-branch', text: branchText }))
-      item.appendChild(info)
-      const badges: string[] = []
-      if (wt.bare) badges.push('bare')
-      if (wt.locked) badges.push('locked')
-      if (wt.prunable) badges.push('prunable')
-      for (const badge of badges) {
-        item.appendChild(el('span', { class: 'dsh-wt-dropdown-item-badge', text: badge }))
-      }
-      item.onclick = async (e: MouseEvent) => {
-        e.stopPropagation()
-        item.setAttribute('disabled', 'disabled')
-        try {
-          await ensureAndSwitchWorkspace(wt.path)
-          closeDropdown()
-        } catch (err) {
-          item.removeAttribute('disabled')
-          const msg = err instanceof Error ? err.message : String(err)
-          dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: msg }))
+    for (const group of loaded) {
+      const filtered = group.worktrees.filter(wt => {
+        if (!hasFilter) return true
+        const name = basename(wt.path).toLowerCase()
+        const branch = (wt.branch ?? '').toLowerCase()
+        return name.includes(lower) || branch.includes(lower) || wt.path.toLowerCase().includes(lower)
+      })
+
+      // When filtering, hide repos with no matches; otherwise show all (even empty)
+      if (hasFilter && filtered.length === 0) continue
+      totalShown += filtered.length
+
+      const groupEl = el('div', { class: 'dsh-wt-repo-group' })
+      const header = el('div', { class: 'dsh-wt-repo-header' })
+      // Expand current repo by default; when filtering, expand all
+      const expanded = hasFilter || group.repo.root === currentRepoRoot
+      const toggle = el('span', { class: 'dsh-wt-repo-toggle', text: expanded ? '▼' : '▶' })
+      header.appendChild(toggle)
+      header.appendChild(el('span', { class: 'dsh-wt-repo-name', text: group.repo.name, title: group.repo.root }))
+      const countText = group.error
+        ? '加载失败'
+        : `${filtered.length} 个 worktree`
+      header.appendChild(el('span', { class: 'dsh-wt-repo-count', text: countText }))
+      groupEl.appendChild(header)
+
+      const body = el('div', { class: `dsh-wt-repo-body${expanded ? ' open' : ''}` })
+
+      if (group.error) {
+        body.appendChild(el('div', { class: 'dsh-wt-repo-empty', text: group.error }))
+      } else if (filtered.length === 0) {
+        body.appendChild(el('div', { class: 'dsh-wt-repo-empty', text: '无 worktree' }))
+      } else {
+        for (const wt of filtered) {
+          const item = el('button', { class: 'dsh-wt-dropdown-item' })
+          const info = el('div', { class: 'dsh-wt-dropdown-item-info' })
+          info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-path', text: basename(wt.path), title: wt.path }))
+          const branchText = wt.branch ? wt.branch : `HEAD: ${wt.head.slice(0, 8)}`
+          info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-branch', text: branchText }))
+          item.appendChild(info)
+          const badges: string[] = []
+          if (wt.bare) badges.push('bare')
+          if (wt.locked) badges.push('locked')
+          if (wt.prunable) badges.push('prunable')
+          for (const badge of badges) {
+            item.appendChild(el('span', { class: 'dsh-wt-dropdown-item-badge', text: badge }))
+          }
+          item.onclick = async (e: MouseEvent) => {
+            e.stopPropagation()
+            item.setAttribute('disabled', 'disabled')
+            try {
+              await ensureAndSwitchWorkspace(wt.path)
+              closeDropdown()
+            } catch (err) {
+              item.removeAttribute('disabled')
+              const msg = err instanceof Error ? err.message : String(err)
+              dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: msg }))
+            }
+          }
+          body.appendChild(item)
         }
       }
-      listContainer.appendChild(item)
+
+      header.onclick = (e: MouseEvent) => {
+        e.stopPropagation()
+        const isOpen = body.classList.toggle('open')
+        toggle.textContent = isOpen ? '▼' : '▶'
+      }
+
+      groupEl.appendChild(body)
+      listContainer.appendChild(groupEl)
+    }
+
+    if (totalShown === 0) {
+      listContainer.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '无匹配 worktree' }))
     }
   }
 
@@ -422,8 +475,15 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   searchBox.onclick = (e: MouseEvent) => e.stopPropagation()
   renderList('')
 
-  // 4. Create-new-worktree row
+  // 5. Create-new-worktree row (target repo selectable, defaults to current repo)
   const createRow = el('div', { class: 'dsh-wt-dropdown-create' })
+  const repoSelect = el('select', { class: 'dsh-wt-dropdown-input' })
+  for (const g of loaded) {
+    const opt = el('option', { value: g.repo.root, text: g.repo.name })
+    if (g.repo.root === currentRepoRoot) opt.setAttribute('selected', 'selected')
+    repoSelect.appendChild(opt)
+  }
+  createRow.appendChild(repoSelect)
   const branchInput = el('input', {
     class: 'dsh-wt-dropdown-input',
     placeholder: '新分支名 (如 feature/xxx)',
@@ -434,10 +494,11 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     e.stopPropagation()
     const branch = branchInput.value.trim()
     if (!branch) return
+    const repoPath = repoSelect.value
     createBtn.setAttribute('disabled', 'disabled')
     try {
       const result = await apiPost('create', {
-        repoPath: wsPath,
+        repoPath,
         branch,
         newBranch: true,
       }) as CreateResponse

@@ -9,6 +9,7 @@
  *
  * Routes:
  *   GET  /plugins/dsh-worktree-manager/api/list?repoPath=<path>
+ *   GET  /plugins/dsh-worktree-manager/api/repos
  *   POST /plugins/dsh-worktree-manager/api/create   { repoPath, branch, targetPath?, newBranch? }
  *   POST /plugins/dsh-worktree-manager/api/remove   { worktreePath, force? }
  *   POST /plugins/dsh-worktree-manager/api/branches { repoPath }
@@ -85,6 +86,31 @@ interface RemoveRequest {
 /** Request body for branches. */
 interface BranchesRequest {
   repoPath: string
+}
+
+/** One workspace entry under a discovered repository root. */
+interface RepoWorkspace {
+  /** dsh workspace id. */
+  id: string
+  /** Workspace directory path (canonicalized at registry create time). */
+  path: string
+  /** Display title. */
+  title: string
+}
+
+/** One discovered repository root with its registered dsh workspaces. */
+interface RepoGroup {
+  /** Canonical git repository root (parent of the common `.git`). */
+  root: string
+  /** Basename of {@link root}, for display. */
+  name: string
+  /** dsh workspaces whose path lives inside this repository (any worktree). */
+  workspaces: RepoWorkspace[]
+}
+
+/** Response body for the repos aggregation route. */
+interface ReposResponse {
+  repos: RepoGroup[]
 }
 
 /** Run a git command in the given directory and return trimmed stdout. */
@@ -231,6 +257,59 @@ async function handleList(query: Record<string, string>): Promise<WorktreeInfo[]
   return parseWorktreeList(porcelain)
 }
 
+/**
+ * Resolve the git repository root (parent of the common `.git` dir) for a path.
+ * Returns null when the path is not inside a git repository. Uses
+ * `git rev-parse --git-common-dir` so linked worktrees resolve to the same
+ * root as their main worktree, letting us group all worktrees of one repo.
+ */
+async function resolveRepoRoot(startPath: string): Promise<string | null> {
+  try {
+    const commonDir = await runGit(startPath, ['rev-parse', '--git-common-dir'])
+    // commonDir may be relative (".git" for main worktree) or absolute
+    // (linked worktree points at the main .git). Resolve to absolute, then
+    // take the parent as the repository root.
+    const abs = commonDir.startsWith('/')
+      ? commonDir
+      : resolve(startPath, commonDir)
+    const root = dirname(abs)
+    return await realpath(root).catch(() => root)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Scan all registered dsh workspaces, group those that live inside a git
+ * repository by their shared repository root, and return one entry per
+ * repository. Workspaces not inside any git repository are omitted. The same
+ * workspace path appearing under multiple worktrees is listed once per
+ * repository it belongs to (in practice exactly one).
+ */
+async function handleRepos(ctx: Context): Promise<ReposResponse> {
+  const workspaces = ctx.workspaceRegistry.list()
+  const groups = new Map<string, RepoGroup>()
+
+  for (const ws of workspaces) {
+    const root = await resolveRepoRoot(ws.path)
+    if (!root) continue
+    let group = groups.get(root)
+    if (!group) {
+      group = {
+        root,
+        name: root.replace(/\/+$/, '').split('/').pop() ?? root,
+        workspaces: [],
+      }
+      groups.set(root, group)
+    }
+    group.workspaces.push({ id: ws.id, path: ws.path, title: ws.title })
+  }
+
+  // Stable order: by repository root path
+  const repos = [...groups.values()].sort((a, b) => a.root.localeCompare(b.root))
+  return { repos }
+}
+
 /** Create a new git worktree and register it as a workspace. */
 async function handleCreate(
   ctx: Context,
@@ -315,14 +394,19 @@ function createRouteHandler(ctx: Context) {
         return
       }
       const action = url.slice(API_PREFIX.length).split('?')[0]
-      if (action !== 'list') {
+      if (action !== 'list' && action !== 'repos') {
         sendJson(res, 404, { error: `unknown GET action: ${action}` })
         return
       }
       try {
-        const query = parseQuery(url)
-        const worktrees = await handleList(query)
-        sendJson(res, 200, { worktrees })
+        if (action === 'list') {
+          const query = parseQuery(url)
+          const worktrees = await handleList(query)
+          sendJson(res, 200, { worktrees })
+        } else {
+          const result = await handleRepos(ctx)
+          sendJson(res, 200, result)
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         sendJson(res, errorStatus(message), { error: message })
