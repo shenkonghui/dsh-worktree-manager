@@ -1,21 +1,64 @@
 /**
  * Browser face of the dsh-worktree-manager plugin.
  *
- * Injects a "Git Worktree" button into the task start window's workspace
- * picker. Clicking it opens a dialog that lists existing git worktrees for
- * a repository, lets the user create new worktrees, and selects a worktree
- * for development by registering it as a dsh workspace and feeding the path
- * back into the workspace picker's directory browser.
+ * Two surfaces:
+ *
+ * 1. **Sidebar footer-action panel** (slot registration): registers a
+ *    `sidebar.footer.action` entry that renders a trigger button at the
+ *    sidebar foot. Clicking it opens a panel listing all sessions grouped
+ *    by their git worktree — each session's workspace path is matched to
+ *    the longest-prefix worktree, and sessions without a worktree fall into
+ *    an ungrouped bucket. Clicking a session opens it.
+ *
+ * 2. **Task-start-window Worktree button** (DOM injection): a
+ *    MutationObserver injects a "Worktree" button beside the workspace
+ *    picker chip. Clicking it opens a dropdown for listing, creating, and
+ *    selecting worktrees.
  *
  * Communication with the host goes through the custom HTTP routes registered
  * by the host half at /plugins/dsh-worktree-manager/api/*.
  */
 
+import type { WorktreePanelProps } from './panel'
+import { WorktreePanel } from './panel'
+import { NS as LOCALE_NS, zh as panelZh, en as panelEn } from './locales'
+
 /** API base URL for worktree operations. */
 const API_BASE = '/plugins/dsh-worktree-manager/api/'
 
-/** Required services: none; runs in the browser at boot. */
-export const inject: string[] = []
+// ---- Minimal ClientContext type (no dsh build-time dependency) ----
+// The real ClientContext is merged at runtime by the dsh client runtime; this
+// local declaration carries only the services this plugin's apply touches.
+
+interface ClientLocaleService {
+  register(namespace: string, dict: Record<string, Record<string, string>>): () => void
+}
+
+interface ClientSlotsService {
+  inject(name: string, factory: () => () => void): () => void
+  register(
+    options: { name: string; id?: string; locale?: string; inject?: () => unknown },
+    component: (props: WorktreePanelProps) => JSX.Element,
+  ): () => void
+}
+
+interface ClientSessionsService {
+  open(sessionId: string): void
+}
+
+interface ClientContext {
+  slots: ClientSlotsService
+  sessions: ClientSessionsService
+  locale: ClientLocaleService
+  /** Cordis effect registration (optional in the minimal local type). */
+  effect?(factory: () => (() => void) | void, label?: string): (() => void) | void
+}
+
+/**
+ * Required services: the slot system (footer-action registration), the
+ * sessions service (open on click), and the locale service (panel copy).
+ */
+export const inject = ['slots', 'sessions', 'locale'] as const
 
 // ---- Types matching the host-side responses ----
 
@@ -596,8 +639,36 @@ function setupObserver(): void {
   observer.observe(document.body, { childList: true, subtree: true })
 }
 
-/** Install the plugin. */
-export function apply(): void {
+/**
+ * Install the plugin: register the sidebar footer-action panel through the
+ * slot system, register the panel's locale dictionary, and start the DOM
+ * observer for the task-start-window Worktree button.
+ */
+export function apply(ctx: ClientContext): void {
+  // 1. Register the panel's locale dictionary.
+  if (ctx.effect !== undefined) {
+    ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh: panelZh, en: panelEn }), 'dsh-worktree-manager: panel locale')
+  } else {
+    ctx.locale.register(LOCALE_NS, { zh: panelZh, en: panelEn })
+  }
+
+  // 2. Register the sidebar footer-action panel.
+  //    slots.inject waits for the 'sidebar.footer.action' declaration (owned
+  //    by ui-sidebar) and re-registers on redeclaration; the contribution
+  //    leaves with this plugin's fiber.
+  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
+    {
+      name: 'sidebar.footer.action',
+      id: 'worktree-panel',
+      locale: LOCALE_NS,
+      inject: (): { openSession: (sessionId: string) => void } => ({
+        openSession: (sessionId: string) => { ctx.sessions.open(sessionId) },
+      }),
+    },
+    WorktreePanel as unknown as (props: WorktreePanelProps) => JSX.Element,
+  ))
+
+  // 3. Start the DOM observer for the task-start-window Worktree button.
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', setupObserver)
   } else {
