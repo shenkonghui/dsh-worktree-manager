@@ -10,10 +10,9 @@
  * Routes:
  *   GET  /plugins/dsh-worktree-manager/api/list?repoPath=<path>
  *   GET  /plugins/dsh-worktree-manager/api/repos
- *   POST /plugins/dsh-worktree-manager/api/create        { repoPath, branch, targetPath?, newBranch? }
- *   POST /plugins/dsh-worktree-manager/api/remove        { worktreePath, force? }
- *   POST /plugins/dsh-worktree-manager/api/branches      { repoPath }
- *   POST /plugins/dsh-worktree-manager/api/auto-register {}
+ *   POST /plugins/dsh-worktree-manager/api/create   { repoPath, branch, targetPath?, newBranch? }
+ *   POST /plugins/dsh-worktree-manager/api/remove   { worktreePath, force? }
+ *   POST /plugins/dsh-worktree-manager/api/branches { repoPath }
  */
 
 import { execFile } from 'node:child_process'
@@ -441,11 +440,6 @@ function createRouteHandler(ctx: Context) {
             sendJson(res, 200, result)
             break
           }
-          case 'auto-register': {
-            const registered = await autoRegisterWorktrees(ctx)
-            sendJson(res, 200, { registered })
-            break
-          }
           default:
             sendJson(res, 404, { error: `unknown POST action: ${action}` })
         }
@@ -460,45 +454,7 @@ function createRouteHandler(ctx: Context) {
   }
 }
 
-/**
- * Scan all discovered repositories and register every git worktree as a dsh
- * workspace, using the title format `[repo-name] branch-name` so worktrees
- * of the same repository group together in the sidebar's alphabetical order.
- * Already-registered worktrees (matched by canonical path) are skipped.
- * @param ctx - Host plugin context with workspaceRegistry access.
- * @returns the number of newly registered worktrees.
- */
-async function autoRegisterWorktrees(ctx: Context): Promise<number> {
-  const { repos } = await handleRepos(ctx)
-  let registered = 0
-  for (const repo of repos) {
-    let worktrees: WorktreeInfo[]
-    try {
-      worktrees = await handleList({ repoPath: repo.root })
-    } catch {
-      continue
-    }
-    for (const wt of worktrees) {
-      // Skip bare/locked/prunable worktrees — they are not usable working dirs
-      if (wt.bare || wt.locked || wt.prunable) continue
-      // Check if already registered by canonical path
-      const existing = await ctx.workspaceRegistry.resolveByPath(wt.path)
-      if (existing !== undefined) continue
-      // Build a grouped title: [repo-name] branch-or-basename
-      const branch = wt.branch ?? wt.path.replace(/\/+$/, '').split('/').pop() ?? wt.path
-      const title = `[${repo.name}] ${branch}`
-      try {
-        await ctx.workspaceRegistry.create(wt.path, title)
-        registered++
-      } catch {
-        // Directory may not exist or other fs error — skip silently
-      }
-    }
-  }
-  return registered
-}
-
-/** Plugin entry: register HTTP routes and auto-register worktrees as workspaces. */
+/** Plugin entry: register HTTP routes for the worktree management API. */
 export function apply(ctx: Context): void {
   const handler = createRouteHandler(ctx)
 
@@ -508,15 +464,5 @@ export function apply(ctx: Context): void {
     kind: 'prefix',
     path: '/plugins/dsh-worktree-manager/api',
     handler,
-  })
-
-  // Auto-register all git worktrees as dsh workspaces on startup. Errors are
-  // logged to stderr but never fail plugin loading — the HTTP API and manual
-  // registration route remain available regardless.
-  void autoRegisterWorktrees(ctx).then(n => {
-    if (n > 0) process.stderr.write(`dsh-worktree-manager: auto-registered ${n} worktree(s) as workspaces\n`)
-  }).catch(err => {
-    const msg = err instanceof Error ? err.message : String(err)
-    process.stderr.write(`dsh-worktree-manager: auto-register failed: ${msg}\n`)
   })
 }
