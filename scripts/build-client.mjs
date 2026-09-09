@@ -19,6 +19,10 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import {
+	materializeOfficialWorkspaceClientModule,
+	OFFICIAL_WORKSPACE_VIRTUAL_ID,
+} from "./official-workspace-upstream.mjs";
 
 const PLUGIN_ID = "dsh-worktree-manager";
 
@@ -29,12 +33,33 @@ const EXTERNALS = [
 	"react-dom",
 	"react-dom/client",
 	"@deepseek-ai/cordis",
+	"@deepseek-ai/dsh-client-store",
 	"@deepseek-ai/dsh-client-ui-slots",
 	"@deepseek-ai/dsh-client-web-react",
 	"@deepseek-ai/dsh-client-ui-primitives",
 	"@deepseek-ai/dsh-client-ui-attachment",
 	"@deepseek-ai/dsh-client-schema-form",
 ];
+
+/** Resolve the version/hash-gated official Workspace Client as a virtual module. */
+const OFFICIAL_WORKSPACE_NAMESPACE = "official-workspace";
+const officialWorkspacePlugin = {
+	name: "official-workspace-client-source",
+	setup(build) {
+		build.onResolve({ filter: /^virtual:dsh-official-workspace-client$/ }, () => ({
+			path: OFFICIAL_WORKSPACE_VIRTUAL_ID,
+			namespace: OFFICIAL_WORKSPACE_NAMESPACE,
+		}));
+		build.onLoad(
+			{ filter: /^virtual:dsh-official-workspace-client$/, namespace: OFFICIAL_WORKSPACE_NAMESPACE },
+			() => ({
+				contents: materializeOfficialWorkspaceClientModule(),
+				loader: "js",
+				resolveDir: process.cwd(),
+			}),
+		);
+	},
+};
 
 const result = await build({
 	entryPoints: ["src/client/index.ts"],
@@ -46,6 +71,7 @@ const result = await build({
 	external: EXTERNALS,
 	write: false,
 	logLevel: "info",
+	plugins: [officialWorkspacePlugin],
 	// The banner opens the loader factory and declares `module`/`exports`/
 	// `require` as local bindings the CJS body expects. The footer stamps the
 	// plugin name and returns module.exports.

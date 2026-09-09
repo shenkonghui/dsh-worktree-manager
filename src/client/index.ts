@@ -3,12 +3,12 @@
  *
  * Two surfaces:
  *
- * 1. **Sidebar footer-action panel** (slot registration): registers a
- *    `sidebar.footer.action` entry that renders a trigger button at the
- *    sidebar foot. Clicking it opens a panel listing all sessions grouped
- *    by their git worktree — each session's workspace path is matched to
- *    the longest-prefix worktree, and sessions without a worktree fall into
- *    an ungrouped bucket. Clicking a session opens it.
+ * 1. **Managed workspace sidebar** (official client proxy): re-applies the
+ *    version/hash-gated official Workspace Client through a proxied context,
+ *    swapping its Browser component for the managed projection — worktree
+ *    workspaces are hidden and their sessions aggregated under the owning
+ *    repository's workspace row, with branch badges on both workspace and
+ *    session rows. See ./workspace-sidebar.
  *
  * 2. **Task-start-window Worktree button** (DOM injection): a
  *    MutationObserver injects a "Worktree" button beside the workspace
@@ -19,46 +19,20 @@
  * by the host half at /plugins/dsh-worktree-manager/api/*.
  */
 
-import type { WorktreePanelProps } from './panel'
-import { WorktreePanel } from './panel'
-import { NS as LOCALE_NS, zh as panelZh, en as panelEn } from './locales'
-
-/** API base URL for worktree operations. */
-const API_BASE = '/plugins/dsh-worktree-manager/api/'
+import { inject as officialWorkspaceInject } from 'virtual:dsh-official-workspace-client'
+import { registerManagedWorkspaceSidebar } from './workspace-sidebar/index.js'
+import { registerSessionBranchBadge } from './session-branch-badge.js'
+import { apiGet, apiPost, WORKTREE_REFRESH_EVENT, isGroupingEnabled, setGroupingEnabled } from './api.js'
 
 // ---- Minimal ClientContext type (no dsh build-time dependency) ----
 // The real ClientContext is merged at runtime by the dsh client runtime; this
-// local declaration carries only the services this plugin's apply touches.
-
-interface ClientLocaleService {
-  register(namespace: string, dict: Record<string, Record<string, string>>): () => void
-}
-
-interface ClientSlotsService {
-  inject(name: string, factory: () => () => void): () => void
-  register(
-    options: { name: string; id?: string; locale?: string; inject?: () => unknown },
-    component: (props: WorktreePanelProps) => JSX.Element,
-  ): () => void
-}
-
-interface ClientSessionsService {
-  open(sessionId: string): void
-}
-
-interface ClientContext {
-  slots: ClientSlotsService
-  sessions: ClientSessionsService
-  locale: ClientLocaleService
-  /** Cordis effect registration (optional in the minimal local type). */
-  effect?(factory: () => (() => void) | void, label?: string): (() => void) | void
-}
+// local declaration carries only what this plugin's apply touches.
 
 /**
- * Required services: the slot system (footer-action registration), the
- * sessions service (open on click), and the locale service (panel copy).
+ * Services required for the official Workspace Client re-apply (its inject
+ * list); the DOM-injection surface uses none of them directly.
  */
-export const inject = ['slots', 'sessions', 'locale'] as const
+export const inject = [...officialWorkspaceInject as string[]] as const
 
 // ---- Types matching the host-side responses ----
 
@@ -97,25 +71,7 @@ interface ReposResponse {
 }
 
 // ---- API helpers ----
-
-async function apiGet(action: string, params: Record<string, string>): Promise<unknown> {
-  const qs = new URLSearchParams(params).toString()
-  const res = await fetch(`${API_BASE}${action}?${qs}`)
-  const json = await res.json()
-  if (!res.ok) throw new Error((json as { error?: string }).error ?? `HTTP ${res.status}`)
-  return json
-}
-
-async function apiPost(action: string, body: Record<string, unknown>): Promise<unknown> {
-  const res = await fetch(`${API_BASE}${action}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  const json = await res.json()
-  if (!res.ok) throw new Error((json as { error?: string }).error ?? `HTTP ${res.status}`)
-  return json
-}
+// apiGet/apiPost live in ./api.js and are shared with the sidebar projection.
 
 // ---- DOM helpers ----
 
@@ -218,97 +174,177 @@ function injectStyles(): void {
 .dsh-wt-repo-body.open { display: block; }
 .dsh-wt-repo-empty { padding: 8px 12px; font-size: 11px; opacity: 0.5; }
 .dsh-wt-dropdown-create select.dsh-wt-dropdown-input { flex: none; width: auto; min-width: 120px; }
+/* Sidebar branch badges（对齐 dsh-git-worktree 状态徽标的视觉：accent 色字 + 色底 + 色边框 pill） */
+.dsh-worktree-manager-sidebar-icon,
+.dsh-worktree-manager-sidebar-badge { flex: 0 1 auto; min-width: 0; }
+.dsh-worktree-manager-sidebar-icon { flex: 0 0 auto; }
+.dsh-worktree-manager-sidebar-icon {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dsw-alias-state-business-primary, #89b4fa);
+}
+.dsh-worktree-manager-sidebar-badge {
+  --dsh-wt-sidebar-accent: var(--dsw-alias-state-business-primary, #89b4fa);
+  box-sizing: border-box;
+  max-width: 200px;
+  min-height: 20px;
+  padding: 1px 6px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--dsh-wt-sidebar-accent) 24%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--dsh-wt-sidebar-accent) 10%, transparent);
+  color: var(--dsh-wt-sidebar-accent);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 侧边栏「工作区」标题行的分组开关按钮 */
+.dsh-wt-grouping-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; flex: none;
+  border: none; border-radius: 5px; padding: 0;
+  background: transparent; color: var(--dsh-fg-muted, inherit);
+  opacity: 0.55; cursor: pointer;
+}
+.dsh-wt-grouping-btn:hover { background: var(--dsh-hover, rgba(0,0,0,0.06)); opacity: 0.85; }
+.dsh-wt-grouping-btn.active {
+  color: var(--dsw-alias-state-business-primary, #89b4fa);
+  opacity: 1;
+  background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #89b4fa) 12%, transparent);
+}
 `
   document.head.appendChild(style)
 }
 
 // ---- Current workspace detection ----
 
-interface WorkspaceItem {
+// ---- dsh 客户端服务（经 cordis ctx 获取，RPC 走 Connection 的 WebSocket mux） ----
+
+/** useWorkspaces 快照中的 workspace 行（官方 workspace controller 模型）。 */
+interface DshWorkspaceItem {
   workspaceId: string
   path: string
   title: string
+  sessionIds?: readonly string[]
 }
 
-/** Fetch all workspaces via the workspace.list RPC. */
-async function listWorkspaces(): Promise<WorkspaceItem[]> {
-  const res = await fetch('/api/workspace.list', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      type: 'client-request',
-      rpcId: crypto.randomUUID(),
-      method: 'workspace.list',
-      payload: {},
-    }),
-  })
-  const json = await res.json()
-  return json?.result?.value?.items ?? []
+/** 官方 workspace controller 客户端服务（@deepseek-ai/dsh-api-workspace-controller）。 */
+interface DshWorkspacesService {
+  /** 采纳一个已存在的绝对路径为新 Workspace；失败抛 WorkspaceCreateError。 */
+  create(input: { path: string }): Promise<DshWorkspaceItem>
+  /** list 字段即 ClientWorkspaceModel，提供 getSnapshot() 快照。 */
+  list: {
+    getSnapshot(): { items: readonly DshWorkspaceItem[]; archivedSessionIds: readonly string[] }
+  }
 }
 
-// ---- workspace RPC helpers ----
+/** useSessions 快照中的会话摘要（官方 session controller 模型）。 */
+interface DshSessionSummary {
+  id: string
+  displayTitle: string
+  blank: boolean
+  cwd?: string
+  updatedAt?: number
+}
+
+/** 官方 session controller 客户端服务（@deepseek-ai/dsh-api-session-controller）。 */
+interface DshSessionsService {
+  /** 在目标 workspace（或 cwd）下创建一个 blank 会话，返回其 id。 */
+  create(opts: { workspaceId?: string; cwd?: string; sessionId?: string }): Promise<string>
+  /** 切换当前会话。 */
+  open(id: string): void
+  /** list 字段即 useSessions 标准快照源（ids/byId/current）。 */
+  list: {
+    getSnapshot(): {
+      ids: readonly string[]
+      byId: Readonly<Record<string, DshSessionSummary | undefined>>
+      current?: string
+    }
+  }
+}
+
+/** apply 时从 ctx 捕获的客户端服务；inject 列表保证其已就绪。 */
+let workspacesService: DshWorkspacesService | undefined
+let sessionsService: DshSessionsService | undefined
+
+/** 读取当前 workspace 列表快照（同步，来自 client model 缓存）。 */
+function listWorkspaces(): readonly DshWorkspaceItem[] {
+  try {
+    return workspacesService?.list.getSnapshot().items ?? []
+  } catch {
+    return []
+  }
+}
+
+// ---- workspace 服务 helpers ----
 
 /**
  * Check if a workspace exists for the given path.
  * Returns the workspace item if found, null otherwise.
  */
-async function findWorkspace(path: string): Promise<WorkspaceItem | null> {
-  const items = await listWorkspaces().catch(() => [] as WorkspaceItem[])
-  return items.find(it => it.path === path) ?? null
+function findWorkspace(path: string): DshWorkspaceItem | null {
+  return listWorkspaces().find(it => it.path === path) ?? null
 }
 
 /**
- * Create a workspace for the given path via workspace.create RPC.
+ * Create a workspace for the given path via the official workspaces service.
+ * Creates are echoed into the client model, so the sidebar updates directly.
  */
-async function createWorkspace(path: string): Promise<void> {
-  const res = await fetch('/api/workspace.create', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      type: 'client-request',
-      rpcId: crypto.randomUUID(),
-      method: 'workspace.create',
-      payload: { path },
-    }),
-  })
-  const json = await res.json()
-  if (!res.ok) throw new Error(json?.result?.error?.message ?? `HTTP ${res.status}`)
+async function createWorkspace(path: string): Promise<DshWorkspaceItem> {
+  if (workspacesService === undefined) {
+    throw new Error('workspaces 服务不可用：客户端尚未完成初始化')
+  }
+  return workspacesService.create({ path })
+}
+
+/** 归一化路径用于会话 cwd 匹配（去尾部斜杠）。 */
+function normalizePathKey(value: string): string {
+  return value.replace(/\/+$/, '')
 }
 
 /**
- * Ensure a workspace exists for the given path (create if missing),
- * then switch to it by clicking the corresponding sidebar item.
+ * Ensure a workspace exists for the given path, then enter it by creating (or
+ * reusing) a blank session in that workspace and opening it — the session then
+ * appears as a session of the owning repository's workspace row in the sidebar
+ * projection, even though the standalone worktree row is hidden.
  */
 async function ensureAndSwitchWorkspace(path: string): Promise<void> {
-  // Check if workspace already exists
-  let ws = await findWorkspace(path)
-  // Create if missing
-  if (!ws) {
-    await createWorkspace(path)
-    // Re-fetch to get the new workspace item
-    ws = await findWorkspace(path)
+  if (sessionsService === undefined) {
+    throw new Error('sessions 服务不可用：客户端尚未完成初始化')
   }
-  if (!ws) return
+  // Check if workspace already exists, create if missing
+  let ws = findWorkspace(path)
+  if (!ws) ws = await createWorkspace(path)
+  if (!ws) throw new Error(`workspace 创建失败：${path}`)
 
-  // Click the workspace in the sidebar to switch
-  switchToWorkspaceInSidebar(ws)
-}
-
-/**
- * Find and click the workspace row in the dsh sidebar to switch to it.
- * Sidebar workspace rows are div[role="treeitem"] whose title span text
- * matches the workspace title. CSS module hash class names are unstable
- * across builds, so role + text is the stable selector.
- */
-function switchToWorkspaceInSidebar(ws: WorkspaceItem): void {
-  const rows = document.querySelectorAll<HTMLElement>('[role="treeitem"]')
-  for (const row of rows) {
-    const text = (row.textContent ?? '').trim()
-    if (text === ws.title || text.startsWith(ws.title)) {
-      row.click()
-      return
+  // 复用该 workspace 下已有的 blank 会话；否则新建一个并切换。
+  const key = normalizePathKey(path)
+  let blank: DshSessionSummary | undefined
+  try {
+    const snapshot = sessionsService.list.getSnapshot()
+    for (const id of snapshot.ids) {
+      const summary = snapshot.byId[id]
+      if (summary === undefined || !summary.blank) continue
+      if (summary.cwd !== undefined && normalizePathKey(summary.cwd) === key) {
+        blank = summary
+        break
+      }
     }
+  } catch { /* 快照不可用时直接新建 */ }
+
+  if (blank !== undefined) {
+    sessionsService.open(blank.id)
+  } else {
+    const sessionId = await sessionsService.create({ workspaceId: ws.workspaceId })
+    sessionsService.open(sessionId)
   }
+  // 侧边栏拓扑可能变化（新 workspace / 会话归属），通知投影层重新拉取。
+  window.dispatchEvent(new Event(WORKTREE_REFRESH_EVENT))
 }
 
 // ---- Dropdown menu ----
@@ -370,7 +406,7 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   // 2. Detect current workspace path to decide which repo expands by default.
   // The workspace chip button carries a stable aria-label (zh/en) and its
   // text content is the current workspace title.
-  const wsItems = await listWorkspaces().catch(() => [] as WorkspaceItem[])
+  const wsItems = listWorkspaces()
   let currentName = ''
   for (const label of WORKSPACE_CHIP_LABELS) {
     const wsBtn = document.querySelector<HTMLElement>(
@@ -570,6 +606,7 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
 // ---- Composer integration ----
 
 const INJECT_MARKER = 'data-dsh-worktree-btn'
+const GROUPING_BTN_MARKER = 'data-dsh-wt-grouping-btn'
 
 /**
  * Workspace chip button aria-labels (zh/en). The chip is rendered by
@@ -629,46 +666,77 @@ function injectWorktreeButton(): void {
   }
 }
 
+/** 分组开关按钮的小分支图标 SVG。 */
+const GROUPING_SVG = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><circle cx="4.2" cy="3.4" r="1.7" stroke="currentColor" stroke-width="1.2"/><circle cx="4.2" cy="12.6" r="1.7" stroke="currentColor" stroke-width="1.2"/><circle cx="11.8" cy="5" r="1.7" stroke="currentColor" stroke-width="1.2"/><path d="M4.2 5.1v5.8M11.8 6.7c0 2.9-3.4 2.6-5.9 3.1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>'
+
+/**
+ * Inject the "group sessions by worktree" toggle into the sidebar's
+ * 工作区 header row. The projection and session header badge only activate
+ * while this toggle is on; otherwise the official default display is kept.
+ */
+function injectGroupingToggle(): void {
+  if (document.querySelector(`[${GROUPING_BTN_MARKER}]`)) return
+  // 找文本恰为「工作区」的最深元素（侧边栏标题）。
+  let anchor: HTMLElement | null = null
+  for (const node of document.querySelectorAll<HTMLElement>('span,div')) {
+    if (node.childElementCount === 0 && node.textContent?.trim() === '工作区') {
+      anchor = node
+    }
+  }
+  if (anchor === null) return
+  const parent = anchor.parentElement
+  if (parent === null) return
+
+  const btn = el('button', {
+    class: 'dsh-wt-grouping-btn',
+    [GROUPING_BTN_MARKER]: 'true',
+    title: '按工作树分组会话（聚合到仓库行下并显示分支）',
+    'aria-pressed': String(isGroupingEnabled()),
+  })
+  btn.innerHTML = GROUPING_SVG
+  btn.classList.toggle('active', isGroupingEnabled())
+  btn.onclick = (e: MouseEvent) => {
+    e.stopPropagation()
+    const next = !isGroupingEnabled()
+    setGroupingEnabled(next)
+    btn.classList.toggle('active', next)
+    btn.setAttribute('aria-pressed', String(next))
+  }
+  parent.insertBefore(btn, anchor.nextSibling)
+}
+
 /** Set up a MutationObserver to inject the button when the composer row appears. */
 function setupObserver(): void {
   injectWorktreeButton()
+  injectGroupingToggle()
 
   const observer = new MutationObserver(() => {
     injectWorktreeButton()
+    injectGroupingToggle()
   })
   observer.observe(document.body, { childList: true, subtree: true })
 }
 
 /**
- * Install the plugin: register the sidebar footer-action panel through the
- * slot system, register the panel's locale dictionary, and start the DOM
- * observer for the task-start-window Worktree button.
+ * Install the plugin: register the managed workspace sidebar (official client
+ * proxy), then start the DOM observer for the task-start-window Worktree
+ * button.
  */
-export function apply(ctx: ClientContext): void {
-  // 1. Register the panel's locale dictionary.
-  if (ctx.effect !== undefined) {
-    ctx.effect(() => ctx.locale.register(LOCALE_NS, { zh: panelZh, en: panelEn }), 'dsh-worktree-manager: panel locale')
-  } else {
-    ctx.locale.register(LOCALE_NS, { zh: panelZh, en: panelEn })
-  }
-
-  // 2. Register the sidebar footer-action panel.
-  //    slots.inject waits for the 'sidebar.footer.action' declaration (owned
-  //    by ui-sidebar) and re-registers on redeclaration; the contribution
-  //    leaves with this plugin's fiber.
-  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register(
-    {
-      name: 'sidebar.footer.action',
-      id: 'worktree-panel',
-      locale: LOCALE_NS,
-      inject: (): { openSession: (sessionId: string) => void } => ({
-        openSession: (sessionId: string) => { ctx.sessions.open(sessionId) },
-      }),
-    },
-    WorktreePanel as unknown as (props: WorktreePanelProps) => JSX.Element,
-  ))
-
-  // 3. Start the DOM observer for the task-start-window Worktree button.
+export function apply(ctx: unknown): void {
+  // 官方 Workspace Client 经代理上下文重放：拦截 sidebar.workspaces 注册，
+  // 换成托管投影 Browser（聚合 + 分支徽标）。
+  registerManagedWorkspaceSidebar(ctx as Parameters<typeof registerManagedWorkspaceSidebar>[0])
+  // 捕获 workspace/session controller 服务（inject 列表保证已就绪），供
+  // Worktree 下拉的 list/create/enter 使用；其 RPC 走 Connection 的 mux。
+  workspacesService = (ctx as { get(name: string): unknown }).get('workspaces') as
+    | DshWorkspacesService
+    | undefined
+  sessionsService = (ctx as { get(name: string): unknown }).get('sessions') as
+    | DshSessionsService
+    | undefined
+  // 会话头部（聊天窗口）的 worktree 分支胶囊。
+  registerSessionBranchBadge(ctx as Parameters<typeof registerSessionBranchBadge>[0])
+  // Start the DOM observer for the task-start-window Worktree button.
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', setupObserver)
   } else {

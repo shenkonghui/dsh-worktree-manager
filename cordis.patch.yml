@@ -1,9 +1,20 @@
 # Bundle patch for dsh-worktree-manager.
-# Inserts the host-side plugin that registers HTTP routes under
-# /plugins/dsh-worktree-manager/api/* for listing, creating, and removing git
-# worktrees. The client-modules plugin discovers this package's dsh.client
-# declaration and automatically serves the browser bundle
-# (lib/client/index.js) at boot — no separate client row is needed.
+#
+# 1. Conditionally disable the official Workspace client module while this
+#    plugin's replacement is active: the client half re-applies the official
+#    Workspace client through a proxied context and swaps its Browser component
+#    for the managed projection. Provider selection is evaluated by the Loader;
+#    restart DSH after changing the plugin's enabled state.
+# 2. Inserts the host-side plugin that registers HTTP routes under
+#    /plugins/dsh-worktree-manager/api/* for listing, creating, and removing
+#    git worktrees. The client-modules plugin discovers this package's
+#    dsh.client declaration and automatically serves the browser bundle
+#    (lib/client/index.js) at boot — no separate client row is needed.
+
+- id: ui-workspace
+  name: '@deepseek-ai/dsh-client-ui-workspace'
+  disabled: !!js "!!get('worktreeWorkspaceProvider') && [...loader.entries()].some(entry => entry.options?.name === 'dsh-worktree-manager' && !entry.disabled)"
+
 - insert:
     - id: worktree-manager
       name: 'dsh-worktree-manager'

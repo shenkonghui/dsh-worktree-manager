@@ -10,6 +10,7 @@
  * Routes:
  *   GET  /plugins/dsh-worktree-manager/api/list?repoPath=<path>
  *   GET  /plugins/dsh-worktree-manager/api/repos
+ *   GET  /plugins/dsh-worktree-manager/api/topology
  *   POST /plugins/dsh-worktree-manager/api/create   { repoPath, branch, targetPath?, newBranch? }
  *   POST /plugins/dsh-worktree-manager/api/remove   { worktreePath, force? }
  *   POST /plugins/dsh-worktree-manager/api/branches { repoPath }
@@ -20,6 +21,7 @@ import { realpath } from 'node:fs/promises'
 import { resolve, dirname } from 'node:path'
 import { promisify } from 'node:util'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { mountWorkspaceProviderLifecycle } from './workspace-provider-lifecycle.js'
 
 /**
  * Minimal Context type — the full @deepseek-ai/cordis Context is available at
@@ -310,6 +312,85 @@ async function handleRepos(ctx: Context): Promise<ReposResponse> {
   return { repos }
 }
 
+/** 每个仓库的侧边栏投影拓扑：分支归属与 workspace 归属。 */
+interface RepoTopology {
+  /** 规范化 git 仓库根（与 {@link RepoGroup.root} 语义一致）。 */
+  root: string
+  /** 展示名（根路径 basename）。 */
+  name: string
+  /** 主工作树（path === root）当前分支；detached HEAD 时缺省。 */
+  mainBranch?: string
+  /** 非主 worktree 列表（含各自分支）。 */
+  worktrees: Array<{ path: string; branch?: string }>
+  /** 注册在该仓库下的 dsh workspace id（主 + worktree）。 */
+  workspaceIds: string[]
+}
+
+/** GET /api/topology 的响应体。 */
+interface TopologyResponse {
+  repos: RepoTopology[]
+}
+
+/**
+ * Build the sidebar projection topology: for every registered dsh workspace
+ * grouped under its git repository root, expose the main branch, the linked
+ * worktree paths with their branches, and the workspace ids living under the
+ * repository. The client projection uses this to aggregate worktree sessions
+ * under the repository's main workspace row and to label branch names.
+ */
+async function handleTopology(ctx: Context): Promise<TopologyResponse> {
+  const workspaces = ctx.workspaceRegistry.list()
+  const groups = new Map<string, { root: string; name: string; workspaceIds: string[] }>()
+
+  for (const ws of workspaces) {
+    const root = await resolveRepoRoot(ws.path)
+    if (!root) continue
+    let group = groups.get(root)
+    if (!group) {
+      group = {
+        root,
+        name: root.replace(/\/+$/, '').split('/').pop() ?? root,
+        workspaceIds: [],
+      }
+      groups.set(root, group)
+    }
+    group.workspaceIds.push(ws.id)
+  }
+
+  const repos: RepoTopology[] = []
+  for (const group of groups.values()) {
+    let worktrees: WorktreeInfo[] = []
+    try {
+      const porcelain = await runGit(group.root, ['worktree', 'list', '--porcelain'])
+      worktrees = parseWorktreeList(porcelain)
+    } catch {
+      // Prunable / broken repository: report the workspace grouping with no
+      // worktree branches instead of failing the whole topology.
+    }
+    // Compare realpath-canonicalized paths: porcelain paths may keep symlinks.
+    const canonical = await Promise.all(worktrees.map(async wt => ({
+      wt,
+      path: await realpath(wt.path).catch(() => wt.path),
+    })))
+    const main = canonical.find(entry => entry.path === group.root)
+    repos.push({
+      root: group.root,
+      name: group.name,
+      ...(main?.wt.branch === undefined ? {} : { mainBranch: main.wt.branch }),
+      worktrees: canonical
+        .filter(entry => entry !== main && !entry.wt.bare)
+        .map(entry => ({
+          path: entry.path,
+          ...(entry.wt.branch === undefined ? {} : { branch: entry.wt.branch }),
+        })),
+      workspaceIds: group.workspaceIds,
+    })
+  }
+
+  repos.sort((a, b) => a.root.localeCompare(b.root))
+  return { repos }
+}
+
 /** Create a new git worktree and register it as a workspace. */
 async function handleCreate(
   ctx: Context,
@@ -394,7 +475,7 @@ function createRouteHandler(ctx: Context) {
         return
       }
       const action = url.slice(API_PREFIX.length).split('?')[0]
-      if (action !== 'list' && action !== 'repos') {
+      if (action !== 'list' && action !== 'repos' && action !== 'topology') {
         sendJson(res, 404, { error: `unknown GET action: ${action}` })
         return
       }
@@ -403,6 +484,9 @@ function createRouteHandler(ctx: Context) {
           const query = parseQuery(url)
           const worktrees = await handleList(query)
           sendJson(res, 200, { worktrees })
+        } else if (action === 'topology') {
+          const result = await handleTopology(ctx)
+          sendJson(res, 200, result)
         } else {
           const result = await handleRepos(ctx)
           sendJson(res, 200, result)
@@ -455,7 +539,11 @@ function createRouteHandler(ctx: Context) {
 }
 
 /** Plugin entry: register HTTP routes for the worktree management API. */
-export function apply(ctx: Context): void {
+export async function apply(ctx: Context): Promise<void> {
+  // 让 cordis.patch.yml 的条件禁用表达式生效：提供 worktreeWorkspaceProvider
+  // 并与 Loader 生命周期 reconcile 官方 Workspace 条目的禁用/恢复。
+  await mountWorkspaceProviderLifecycle(ctx as unknown as Parameters<typeof mountWorkspaceProviderLifecycle>[0])
+
   const handler = createRouteHandler(ctx)
 
   // Register a prefix route so all /plugins/dsh-worktree-manager/api/* requests
