@@ -189,6 +189,8 @@ function setupObserver(): void {
  * proxy), then start the DOM observer for the 视图选项 menu item.
  */
 export function apply(ctx: unknown): void {
+  // 注入分支徽标胶囊样式（侧边栏投影与会话头部胶囊共用）。
+  injectStyles()
   // 官方 Workspace Client 经代理上下文重放：拦截 sidebar.workspaces 注册，
   // 换成托管投影 Browser（聚合 + 分支徽标）。
   registerManagedWorkspaceSidebar(ctx as Parameters<typeof registerManagedWorkspaceSidebar>[0])
