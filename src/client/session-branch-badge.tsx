@@ -12,7 +12,7 @@ import { matchWorktreeByPath, type WorktreeMatch } from './workspace-sidebar/mod
 import { useTopology } from './workspace-sidebar/topology.js'
 
 /** 官方 session controller 客户端服务的最小读取面。 */
-interface SessionsListService {
+export interface SessionsListService {
   list: {
     getSnapshot(): {
       byId: Readonly<Record<string, { cwd?: string } | undefined>>
@@ -21,7 +21,7 @@ interface SessionsListService {
 }
 
 /** 读取会话 cwd：快照同步可读，未就绪时短暂轮询直至命中。 */
-function useSessionCwd(sessionId: string | undefined, sessions: SessionsListService | undefined): string | undefined {
+export function useSessionCwd(sessionId: string | undefined, sessions: SessionsListService | undefined): string | undefined {
   const [cwd, setCwd] = useState<string | undefined>(undefined)
   useEffect(() => {
     if (sessionId === undefined || sessions === undefined) return

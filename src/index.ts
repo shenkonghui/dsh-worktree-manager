@@ -11,6 +11,10 @@
  *   GET  /plugins/dsh-worktree-manager/api/list?repoPath=<path>
  *   GET  /plugins/dsh-worktree-manager/api/repos
  *   GET  /plugins/dsh-worktree-manager/api/topology
+ *   GET  /plugins/dsh-worktree-manager/api/changes?path=<dir>
+ *   GET  /plugins/dsh-worktree-manager/api/history?path=<dir>&limit=<n>
+ *   GET  /plugins/dsh-worktree-manager/api/commit?path=<dir>&hash=<sha>
+ *   GET  /plugins/dsh-worktree-manager/api/diff?path=<dir>&file=<rel>[&sub=<rel>][&hash=<sha>]
  *   POST /plugins/dsh-worktree-manager/api/create   { repoPath, branch, targetPath?, newBranch? }
  *   POST /plugins/dsh-worktree-manager/api/remove   { worktreePath, force? }
  *   POST /plugins/dsh-worktree-manager/api/branches { repoPath }
@@ -391,6 +395,311 @@ async function handleTopology(ctx: Context): Promise<TopologyResponse> {
   return { repos }
 }
 
+/** One changed path from `git status --porcelain=v2`. */
+interface ChangeFile {
+  /** Two-letter XY status code; `??` marks untracked. */
+  code: string
+  /** Path relative to the containing worktree root. */
+  path: string
+  /** Original path for renames/copies. */
+  origPath?: string
+  /** Whether the row is a gitlink (submodule pointer) change. */
+  gitlink?: boolean
+}
+
+/** One git submodule with its own working-tree changes. */
+interface SubmoduleChanges {
+  /** Submodule path relative to the superproject worktree root. */
+  path: string
+  /** Display name (path basename). */
+  name: string
+  /** Checked-out commit differs from the superproject index (`+` in submodule status). */
+  newCommits: boolean
+  /** Submodule not initialized (`-` in submodule status). */
+  uninitialized: boolean
+  /** Working-tree changes inside the submodule. */
+  files: ChangeFile[]
+}
+
+/** Response body for the changes route. */
+interface ChangesResponse {
+  /** Worktree top-level directory the queried path belongs to. */
+  root: string
+  /** Current branch; absent on detached HEAD. */
+  branch?: string
+  /** Working-tree changes of the superproject (gitlink rows excluded). */
+  files: ChangeFile[]
+  /** Per-submodule changes, in `git submodule status` order. */
+  submodules: SubmoduleChanges[]
+}
+
+/** Resolve the worktree top-level directory containing the given path. */
+async function resolveWorktree(path: string): Promise<string> {
+  const top = await runGit(path, ['rev-parse', '--show-toplevel'])
+  return realpath(top).catch(() => top)
+}
+
+/** Current branch name of the worktree; absent on detached HEAD or error. */
+async function currentBranch(root: string): Promise<string | undefined> {
+  try {
+    const ref = await runGit(root, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    return ref === 'HEAD' ? undefined : ref
+  } catch {
+    return undefined
+  }
+}
+
+/** Parse `git status --porcelain=v2 -z` output into changed-path rows. Exported for the self-check script. */
+export function parseStatusPorcelainV2(out: string): ChangeFile[] {
+  const fields = out.split('\u0000')
+  const files: ChangeFile[] = []
+  for (let i = 0; i < fields.length; i++) {
+    const line = fields[i]
+    if (line === '') continue
+    if (line.startsWith('1 ')) {
+      // 1 XY sub mH mI mW hH hI <path>
+      const parts = line.split(' ')
+      files.push({
+        code: parts[1] ?? '',
+        path: parts.slice(8).join(' '),
+        ...(parts[3] === '160000' ? { gitlink: true } : {}),
+      })
+    } else if (line.startsWith('2 ')) {
+      // 2 XY sub mH mI mW hH hI Xscore <path> NUL <origPath>
+      const parts = line.split(' ')
+      const origPath = fields[++i] ?? ''
+      files.push({ code: parts[1] ?? '', path: parts.slice(9).join(' '), origPath })
+    } else if (line.startsWith('u ')) {
+      // u XY sub m1 m2 m3 mW h1 h2 h3 <path>
+      const parts = line.split(' ')
+      files.push({ code: parts[1] ?? '', path: parts.slice(10).join(' ') })
+    } else if (line.startsWith('? ')) {
+      files.push({ code: '??', path: line.slice(2) })
+    }
+  }
+  return files
+}
+
+/** Parse `git submodule status` output. Exported for the self-check script. */
+export function parseSubmoduleStatus(out: string): Array<{ path: string; newCommits: boolean; uninitialized: boolean }> {
+  return out.split('\n').filter(line => line !== '').map(line => {
+    // <X><40-char sha> <path>[ (<describe>)]; X is ' ' | '+' | '-' | 'U'.
+    const path = line.slice(42).split(' ')[0] ?? ''
+    return { path, newCommits: line[0] === '+', uninitialized: line[0] === '-' }
+  })
+}
+
+/** Collect the working-tree changes of the repository containing query.path, recursing into submodules. */
+async function handleChanges(query: Record<string, string>): Promise<ChangesResponse> {
+  if (!query.path) throw new Error('missing path query parameter')
+  const root = await resolveWorktree(query.path)
+
+  const entries = parseStatusPorcelainV2(
+    await runGit(root, ['status', '--porcelain=v2', '-z', '--untracked-files=normal']),
+  )
+  // Gitlink rows (submodule pointer changes) are covered by the submodule
+  // section below; keeping them would double-count.
+  const files = entries.filter(entry => !entry.gitlink)
+
+  let subStatus: string[] = []
+  try {
+    subStatus = (await runGit(root, ['submodule', 'status'])).split('\n').filter(line => line !== '')
+  } catch {
+    // no submodules (or git too old) — empty list
+  }
+  const submodules = (await Promise.all(parseSubmoduleStatus(subStatus.join('\n')).map(async sub => {
+    let files: ChangeFile[] = []
+    if (!sub.uninitialized) {
+      try {
+        files = parseStatusPorcelainV2(
+          await runGit(resolve(root, sub.path), ['status', '--porcelain=v2', '-z']),
+        )
+      } catch {
+        // submodule gitdir missing/prunable — report the marker without files
+      }
+    }
+    return { ...sub, name: sub.path.replace(/\/+$/, '').split('/').pop() ?? sub.path, files }
+  }))).filter(sub => !sub.uninitialized && (sub.newCommits || sub.files.length > 0))
+
+  return { root, branch: await currentBranch(root), files, submodules }
+}
+
+/** One commit row from the history route. */
+interface CommitInfo {
+  /** Full commit hash. */
+  hash: string
+  /** Commit subject (first log line). */
+  subject: string
+  /** Author name. */
+  author: string
+  /** Commit time as epoch milliseconds. */
+  date: number
+}
+
+/** Response body for the history route. */
+interface HistoryResponse {
+  root: string
+  branch?: string
+  commits: CommitInfo[]
+}
+
+/** Upper bound for the history limit parameter. */
+const MAX_HISTORY_LIMIT = 200
+
+/** Commit history of the worktree, newest first. */
+async function handleHistory(query: Record<string, string>): Promise<HistoryResponse> {
+  if (!query.path) throw new Error('missing path query parameter')
+  const root = await resolveWorktree(query.path)
+  let out: string
+  try {
+    out = await runGit(root, ['log', `--max-count=${historyLimit(query)}`, '--pretty=format:%H%x1f%an%x1f%ct%x1f%s'])
+  } catch {
+    // Empty repository (no commits yet) or unborn HEAD.
+    return { root, branch: await currentBranch(root), commits: [] }
+  }
+  const commits = out.split('\n').filter(line => line !== '').map(line => {
+    const [hash, author, date, ...rest] = line.split('\u001f')
+    return { hash: hash ?? '', author: author ?? '', date: Number(date) * 1000, subject: rest.join('\u001f') }
+  })
+  return { root, branch: await currentBranch(root), commits }
+}
+
+/** Clamp the history limit query parameter into [1, MAX_HISTORY_LIMIT]. */
+function historyLimit(query: Record<string, string>): number {
+  const parsed = Number.parseInt(query.limit ?? '', 10)
+  return Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), MAX_HISTORY_LIMIT) : 50
+}
+
+/**
+ * One changed path in a commit: `git diff-tree -r -z` rows. Gitlink rows
+ * (mode 160000) carry the old/new submodule pointers instead of a blob sha.
+ */
+interface DiffRow {
+  code: string
+  path: string
+  origPath?: string
+  gitlink?: boolean
+  /** Old submodule pointer (all-zero when the submodule was added). */
+  oldSha?: string
+  /** New submodule pointer (all-zero when the submodule was removed). */
+  newSha?: string
+}
+
+/**
+ * Parse `git diff-tree -r -z --no-commit-id <hash>` output. Each record is
+ * `:<oldMode> <newMode> <oldSha> <newSha> <status>[score]` NUL `<path>` NUL
+ * (plus `<origPath>` NUL for renames/copies). Exported for the self-check script.
+ */
+export function parseDiffTree(out: string): DiffRow[] {
+  const fields = out.split('\u0000')
+  const rows: DiffRow[] = []
+  for (let i = 0; i < fields.length; i++) {
+    const line = fields[i]
+    if (!line.startsWith(':')) continue
+    // :<oldMode> <newMode> <oldSha> <newSha> <status>[score]
+    const parts = line.split(' ')
+    const status = (parts[4] ?? 'M')[0] ?? 'M'
+    const path = fields[++i] ?? ''
+    const row: DiffRow = { code: status, path }
+    if (status === 'R' || status === 'C') row.origPath = fields[++i] ?? ''
+    if (parts[1] === '160000' || parts[0] === ':160000') {
+      row.gitlink = true
+      row.oldSha = parts[2] ?? ''
+      row.newSha = parts[3] ?? ''
+    }
+    rows.push(row)
+  }
+  return rows
+}
+
+/** Response body for the commit detail route. */
+interface CommitDetailResponse {
+  files: ChangeFile[]
+  /** Submodule pointer changes with the submodule commits between the two pointers. */
+  submodules: Array<{ path: string; name: string; commits: string[] }>
+}
+
+/** Commit detail: changed files plus, for submodule pointer changes, the submodule commits in between. */
+async function handleCommitDetail(query: Record<string, string>): Promise<CommitDetailResponse> {
+  if (!query.path) throw new Error('missing path query parameter')
+  if (!query.hash || !/^[0-9a-f]{4,40}$/i.test(query.hash)) throw new Error('invalid hash parameter')
+  const root = await resolveWorktree(query.path)
+
+  const rows = parseDiffTree(await runGit(root, ['diff-tree', '-r', '-z', '--no-commit-id', query.hash]))
+  const files = rows
+    .filter(row => !row.gitlink)
+    .map(row => ({ code: row.code, path: row.path, ...(row.origPath !== undefined ? { origPath: row.origPath } : {}) }))
+  const submodules = await Promise.all(rows.filter(row => row.gitlink).map(async row => {
+    // List the submodule commits the pointer moved over. All-zero old sha
+    // means the submodule was added — show its recent history up to the pointer.
+    let commits: string[] = []
+    try {
+      const range = /^0+$/.test(row.newSha ?? '')
+        ? undefined
+        : /^0+$/.test(row.oldSha ?? '') ? (row.newSha ?? '') : `${row.oldSha}..${row.newSha}`
+      if (range !== undefined) {
+        commits = (await runGit(resolve(root, row.path), ['log', '--no-decorate', '--oneline', '-n20', range]))
+          .split('\n').filter(line => line !== '')
+      }
+    } catch {
+      // submodule gitdir missing/prunable — empty commit list
+    }
+    return {
+      path: row.path,
+      name: row.path.replace(/\/+$/, '').split('/').pop() ?? row.path,
+      commits,
+    }
+  }))
+  return { files, submodules }
+}
+
+/** Response body for the diff route. */
+interface DiffResponse {
+  /** Unified diff of one file (empty string when the file has no content change). */
+  diff: string
+}
+
+/** Reject file parameters that escape the containing worktree. */
+function safeRelPath(value: string): string {
+  if (value === '' || value.startsWith('/') || value.split('/').includes('..')) {
+    throw new Error('invalid file parameter')
+  }
+  return value
+}
+
+/**
+ * Unified diff of one file. With `hash`, the commit's diff for that file;
+ * otherwise the working tree vs HEAD (staged + unstaged). Untracked files have
+ * no HEAD diff — fall back to a /dev/null pseudo-diff (`git diff --no-index`
+ * exits 1 when differences exist, with the diff on stdout).
+ */
+async function handleDiff(query: Record<string, string>): Promise<DiffResponse> {
+  if (!query.path) throw new Error('missing path query parameter')
+  const file = safeRelPath(query.file ?? '')
+  const root = await resolveWorktree(query.path)
+  const workdir = query.sub ? resolve(root, safeRelPath(query.sub)) : root
+
+  if (query.hash !== undefined) {
+    if (!/^[0-9a-f]{4,40}$/i.test(query.hash)) throw new Error('invalid hash parameter')
+    return { diff: await runGit(workdir, ['show', '--format=', query.hash, '--', file]) }
+  }
+
+  let diff = ''
+  try {
+    diff = await runGit(workdir, ['diff', 'HEAD', '--', file])
+  } catch {
+    // unborn HEAD — fall through to the untracked pseudo-diff
+  }
+  if (diff === '') {
+    try {
+      diff = await runGit(workdir, ['diff', '--no-index', '--', '/dev/null', file])
+    } catch (err) {
+      diff = (err as { stdout?: string }).stdout ?? ''
+    }
+  }
+  return { diff }
+}
+
 /** Create a new git worktree and register it as a workspace. */
 async function handleCreate(
   ctx: Context,
@@ -475,7 +784,8 @@ function createRouteHandler(ctx: Context) {
         return
       }
       const action = url.slice(API_PREFIX.length).split('?')[0]
-      if (action !== 'list' && action !== 'repos' && action !== 'topology') {
+      if (action !== 'list' && action !== 'repos' && action !== 'topology' && action !== 'changes'
+        && action !== 'history' && action !== 'commit' && action !== 'diff') {
         sendJson(res, 404, { error: `unknown GET action: ${action}` })
         return
       }
@@ -486,6 +796,18 @@ function createRouteHandler(ctx: Context) {
           sendJson(res, 200, { worktrees })
         } else if (action === 'topology') {
           const result = await handleTopology(ctx)
+          sendJson(res, 200, result)
+        } else if (action === 'changes') {
+          const result = await handleChanges(parseQuery(url))
+          sendJson(res, 200, result)
+        } else if (action === 'history') {
+          const result = await handleHistory(parseQuery(url))
+          sendJson(res, 200, result)
+        } else if (action === 'commit') {
+          const result = await handleCommitDetail(parseQuery(url))
+          sendJson(res, 200, result)
+        } else if (action === 'diff') {
+          const result = await handleDiff(parseQuery(url))
           sendJson(res, 200, result)
         } else {
           const result = await handleRepos(ctx)

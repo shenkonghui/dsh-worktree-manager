@@ -30,6 +30,11 @@ A Cordis plugin that injects `ctx.webServer`, `ctx.shell`, and `ctx.workspaceReg
 |--------|------|-------------|
 | GET | `/api/list?repoPath=<path>` | List git worktrees for a repository |
 | GET | `/api/repos` | Scan all dsh workspaces and group them by git repository root |
+| GET | `/api/topology` | Per-repo branch/workspace topology for the sidebar projection |
+| GET | `/api/changes?path=<dir>` | Working-tree changes of the containing repo, recursing into submodules |
+| GET | `/api/history?path=<dir>&limit=<n>` | Commit history of the containing worktree, newest first |
+| GET | `/api/commit?path=<dir>&hash=<sha>` | One commit's changed files; submodule pointer moves list the submodule commits in between |
+| GET | `/api/diff?path=<dir>&file=<rel>[&sub=<rel>][&hash=<sha>]` | Unified diff of one file (working tree vs HEAD, or one commit) |
 | POST | `/api/create` | Create a new worktree and register it as a workspace |
 | POST | `/api/remove` | Remove a git worktree |
 | POST | `/api/branches` | List branches in a repository |
@@ -114,6 +119,54 @@ Returns:
   ]
 }
 ```
+
+### `GET /plugins/dsh-worktree-manager/api/changes`
+
+Query parameters: `path` (required, any directory inside the repo/worktree)
+
+Returns the working-tree changes of the containing worktree. Submodule pointer rows are excluded from `files` and reported per submodule instead; each submodule's own working-tree changes are listed file-level.
+
+```json
+{
+  "root": "/path/to/worktree",
+  "branch": "main",
+  "files": [{ "code": "??", "path": "new.txt" }],
+  "submodules": [
+    {
+      "path": "sub",
+      "name": "sub",
+      "newCommits": true,
+      "uninitialized": false,
+      "files": [{ "code": " M", "path": "a.txt" }]
+    }
+  ]
+}
+```
+
+### `GET /plugins/dsh-worktree-manager/api/history`
+
+Query parameters: `path` (required), `limit` (optional, 1–200, default 50)
+
+Returns `{ root, branch?, commits: [{ hash, subject, author, date }] }` (date = epoch ms). Empty `commits` for a repository with no commits yet.
+
+### `GET /plugins/dsh-worktree-manager/api/commit`
+
+Query parameters: `path` (required), `hash` (required, commit hash)
+
+Returns one commit's changed files. Submodule pointer rows become `submodules` entries listing the submodule commits between the old and new pointer (`git -C <submodule> log old..new`).
+
+```json
+{
+  "files": [{ "code": "M", "path": "f.txt" }],
+  "submodules": [{ "path": "sub", "name": "sub", "commits": ["abc1234 sub change"] }]
+}
+```
+
+### `GET /plugins/dsh-worktree-manager/api/diff`
+
+Query parameters: `path` (required), `file` (required, repo-relative), `sub` (optional, submodule-relative directory the file lives in), `hash` (optional, commit hash)
+
+Returns `{ diff }` — the unified diff of one file. With `hash`, the commit's diff for the file; otherwise the working tree vs HEAD (staged + unstaged). Untracked files fall back to a `/dev/null` pseudo-diff. `file`/`sub` must stay inside the worktree (absolute paths and `..` segments are rejected).
 
 ### `POST /plugins/dsh-worktree-manager/api/create`
 
