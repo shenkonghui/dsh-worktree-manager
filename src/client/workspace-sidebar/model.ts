@@ -1,12 +1,18 @@
 /**
- * 侧边栏投影纯函数：把外部目录 worktree 的会话聚合回原仓库 workspace 行。
+ * 侧边栏投影纯函数：把外部目录 worktree 的 workspace 行嵌套为其仓库主行
+ * 下的一个层级，会话保留在各自 worktree 行内（不与 worktree 合并为一行，
+ * 会话标题独占整行宽度）。
  *
  * 输入官方 useWorkspaces/useSessions 快照与宿主 /api/topology 拓扑，输出：
- * - 隐藏 worktree 独立 workspace 行（其仓库主行存在且其中有实际会话时），
- *   并把其中非 blank 会话合并进主行的 sessionIds；空 worktree 行保留可见，
- *   用户才能从侧边栏进入该 worktree 开任务；
- * - 为合并会话与保留行标注分支名（渲染为徽标）；
- * - 归属无法证明时 fail-open：保留原行可见并就地标注，绝不隐藏会话。
+ * - worktree 行保留可见，标记为所属仓库主行的嵌套子级（排序紧跟主行、
+ *   渲染层多一级缩进），其会话在行内整行显示标题；
+ * - 仓库主行存在嵌套子级（repo 有 >1 个 worktree）时，为「主 worktree」
+ *   合成一个虚拟二级行，主仓库全部会话移入其中，与 worktree 会话同级；
+ * - 游离会话（不在任何 workspace 的 sessionIds 中、但有 cwd）按最长前缀
+ *   挂到包含它的最内层 workspace 行；
+ * - 为主行与顶层 worktree 行标注分支名（渲染为徽标）；嵌套 worktree 行
+ *   直接以分支名作为标题；会话级分支元数据仅供搜索结果行与 hover 卡片；
+ * - 归属无法证明时 fail-open：worktree 行就地保留为顶层行，绝不隐藏会话。
  */
 
 /** 官方 useWorkspaces 快照中的 workspace 行。 */
@@ -50,21 +56,27 @@ export interface SidebarTopology {
   repos: readonly SidebarTopologyRepo[]
 }
 
-/** 投影结果：投影后的 workspace 行 + 分支标注 + 被抑制的 blank 会话。 */
+/** 投影结果：投影后的 workspace 行 + 分支标注 + 嵌套子级标记。 */
 export interface ManagedSidebarProjection {
-  /** 隐藏行已移除；主行的 sessionIds 已合并 worktree 会话。 */
+  /** worktree 行保留可见；嵌套行已排序到所属仓库主行之后。 */
   workspaces: ProjectedWorkspace[]
-  /** 会话行分支徽标（含可见 worktree 行内的会话）。 */
+  /** 会话级分支元数据（搜索结果行与 hover 卡片徽标）。 */
   branchBySessionId: Readonly<Record<string, string>>
-  /** workspace 行分支徽标（主行 + 保留可见的 worktree 行）。 */
+  /** workspace 行分支徽标（主行 + worktree 行）。 */
   branchByWorkspaceId: Readonly<Record<string, string>>
-  /** 隐藏行中被抑制的 blank 会话（非当前）。 */
-  suppressedSessionIds: ReadonlySet<string>
+  /** 渲染为所属仓库主行下一级（缩进）的 worktree 行。 */
+  nestedWorkspaceIds: ReadonlySet<string>
 }
 
-/** 可变副本：sessionIds 已展开为可合并的普通数组。 */
+/** 可变副本：sessionIds 已展开为可修改的普通数组（用于挂载游离会话）。 */
 export interface ProjectedWorkspace extends SidebarWorkspace {
   sessionIds: string[]
+  /** 合成行标记：主 worktree 虚拟二级行（无对应 workspace 实体）。 */
+  __dshWorktreeManagerVirtual?: boolean
+  /** 虚拟行新建会话时落到的真实 workspaceId。 */
+  __dshWorktreeManagerHost?: string
+  /** 嵌套行的父级 group key（父级折叠时该跟随隐藏）。 */
+  __dshWorktreeManagerParent?: string
 }
 
 /** 去掉尾部斜杠后比较路径（宿主两侧均已 realpath 规范化）。 */
@@ -118,8 +130,8 @@ export function matchWorktreeByPath(
 }
 
 /**
- * 派生聚合投影。主行不存在的 worktree 行、或会话归属有歧义（出现在多个
- * workspace）时 fail-open：行保留可见，行与会话就地标注分支名。
+ * 派生嵌套投影。仓库主行不存在的 worktree 行 fail-open：就地保留为顶层
+ * 行，行与会话照常标注分支名，绝不隐藏会话。
  */
 export function projectManagedSidebar(input: {
   workspaces: readonly SidebarWorkspace[]
@@ -130,14 +142,12 @@ export function projectManagedSidebar(input: {
     ...workspace,
     sessionIds: [...workspace.sessionIds],
   }))
-  const byId = new Map(projected.map(workspace => [workspace.workspaceId, workspace]))
   const branchBySessionId: Record<string, string> = {}
   const branchByWorkspaceId: Record<string, string> = {}
-  const suppressed = new Set<string>()
-  const hidden = new Set<string>()
+  const nested = new Set<string>()
 
   if (input.topology.repos.length === 0) {
-    return { workspaces: projected, branchBySessionId, branchByWorkspaceId, suppressedSessionIds: suppressed }
+    return { workspaces: projected, branchBySessionId, branchByWorkspaceId, nestedWorkspaceIds: nested }
   }
 
   // 拓扑 → 查找表：worktree 路径归属 + 每个仓库的主 workspace 行。
@@ -161,104 +171,97 @@ export function projectManagedSidebar(input: {
     }
   }
 
-  // 每个会话所属的 workspace 数：>1 视为歧义，fail-open。
-  const membershipCount = new Map<string, number>()
-  for (const workspace of projected) {
-    for (const sessionId of workspace.sessionIds) {
-      membershipCount.set(sessionId, (membershipCount.get(sessionId) ?? 0) + 1)
-    }
-  }
-
   // 游离会话索引：不在任何 workspace 的 sessionIds 中、但有 cwd 的会话
-  // （典型是刚创建的 provisional blank 会话）。按 cwd 归属到所在 worktree。
-  const stray: Array<{ id: string; cwd: string; blank: boolean }> = []
+  // （典型是刚创建的 provisional blank 会话）。按 cwd 最长前缀挂到包含它
+  // 的最内层 workspace 行（嵌套目录下 worktree 优先于其仓库主行）。
+  const member = new Set<string>()
+  for (const workspace of projected) {
+    for (const sessionId of workspace.sessionIds) member.add(sessionId)
+  }
+  const stray: Array<{ id: string; cwd: string; claimed: boolean }> = []
   for (const sessionId of input.sessions.ids) {
-    if ((membershipCount.get(sessionId) ?? 0) > 0) continue
+    if (member.has(sessionId)) continue
     const summary = input.sessions.byId[sessionId]
     if (summary === undefined || summary.cwd === undefined) continue
-    stray.push({
-      id: sessionId,
-      cwd: normalizePath(summary.cwd),
-      blank: summary.blank,
-    })
+    stray.push({ id: sessionId, cwd: normalizePath(summary.cwd), claimed: false })
+  }
+  const byPathLengthDesc = [...projected].sort(
+    (a, b) => normalizePath(b.path).length - normalizePath(a.path).length,
+  )
+  for (const workspace of byPathLengthDesc) {
+    const workspacePath = normalizePath(workspace.path)
+    for (const entry of stray) {
+      if (entry.claimed) continue
+      if (entry.cwd !== workspacePath && !entry.cwd.startsWith(workspacePath + '/')) continue
+      workspace.sessionIds.push(entry.id)
+      entry.claimed = true
+    }
   }
 
+  const parentByWorkspaceId = new Map<string, string>()
   for (const workspace of projected) {
-    if (hidden.has(workspace.workspaceId)) continue
     const wt = worktreeByPath.get(normalizePath(workspace.path))
     if (wt === undefined) continue
-
-    // 有效会话集 = 显式成员 + cwd 落在该 worktree 内的游离会话。
-    const workspacePath = normalizePath(workspace.path)
-    const candidateIds = [...workspace.sessionIds]
-    for (const entry of stray) {
-      if (entry.cwd === workspacePath || entry.cwd.startsWith(workspacePath + '/')) {
-        candidateIds.push(entry.id)
-      }
-    }
-
-    const main = mainWorkspaceByRoot.get(wt.repoRoot)
-    const canMerge = main !== undefined
-      && main.workspaceId !== workspace.workspaceId
-      && !hidden.has(main.workspaceId)
-
-    if (canMerge) {
-      // 歧义只针对显式出现在多个 workspace 的会话；游离会话（membership
-      // 为 0）由 cwd 主动归属，不视为歧义。
-      const ambiguous = candidateIds.some(id => (membershipCount.get(id) ?? 0) > 1)
-      if (ambiguous) {
-        // fail-open：归属歧义的 worktree 行保留可见并就地标注。
-        if (wt.branch !== undefined) {
-          branchByWorkspaceId[workspace.workspaceId] = wt.branch
-          for (const sessionId of candidateIds) {
-            const summary = input.sessions.byId[sessionId]
-            if (summary !== undefined && !summary.blank) branchBySessionId[sessionId] = wt.branch
-          }
-        }
-        continue
-      }
-      // 空 worktree 行（没有任何有效会话）保留可见：
-      // 隐藏它只会让用户完全无法从侧边栏进入该 worktree 开任务；等它
-      // 产生会话后再隐藏并聚合进主行（dsh-git-worktree 语义）。
-      const hasContent = candidateIds.some(id => {
-        const summary = input.sessions.byId[id]
-        return summary !== undefined && (!summary.blank || id === input.sessions.current)
-      })
-      if (!hasContent) {
-        if (wt.branch !== undefined) {
-          branchByWorkspaceId[workspace.workspaceId] = wt.branch
-        }
-        continue
-      }
-      for (const sessionId of candidateIds) {
-        const summary = input.sessions.byId[sessionId]
-        if (summary === undefined) continue
-        // blank 且非当前的会话（临时 New Session）随隐藏行一起消失。
-        if (summary.blank && sessionId !== input.sessions.current) {
-          suppressed.add(sessionId)
-          continue
-        }
-        if (!main.sessionIds.includes(sessionId)) main.sessionIds.push(sessionId)
-        if (wt.branch !== undefined) branchBySessionId[sessionId] = wt.branch
-      }
-      hidden.add(workspace.workspaceId)
-      continue
-    }
-
-    // fail-open：仓库主行不存在 → worktree 行保留可见，行 + 会话都标注。
+    // 分支徽标：worktree 行自身 + 其会话（会话级元数据仅供搜索结果行与
+    // hover 卡片；会话树行不再渲染徽标，标题独占整行宽度）。
     if (wt.branch !== undefined) {
       branchByWorkspaceId[workspace.workspaceId] = wt.branch
-      for (const sessionId of candidateIds) {
+      for (const sessionId of workspace.sessionIds) {
         const summary = input.sessions.byId[sessionId]
         if (summary !== undefined && !summary.blank) branchBySessionId[sessionId] = wt.branch
       }
     }
+    // 仓库主行存在时把 worktree 行嵌套为其下一级；否则 fail-open 就地保留。
+    const main = mainWorkspaceByRoot.get(wt.repoRoot)
+    if (main !== undefined && main.workspaceId !== workspace.workspaceId) {
+      nested.add(workspace.workspaceId)
+      parentByWorkspaceId.set(workspace.workspaceId, main.workspaceId)
+      workspace.__dshWorktreeManagerParent = main.workspaceId
+    }
+  }
+
+  // 排序：嵌套 worktree 行紧跟其仓库主行之后（保持原有相对顺序）。
+  const childrenByParent = new Map<string, ProjectedWorkspace[]>()
+  for (const workspace of projected) {
+    const parent = parentByWorkspaceId.get(workspace.workspaceId)
+    if (parent === undefined) continue
+    const children = childrenByParent.get(parent) ?? []
+    children.push(workspace)
+    childrenByParent.set(parent, children)
+  }
+
+  // 主行有嵌套 worktree 子级时，为「主 worktree」合成一个虚拟二级行排最前，
+  // 主仓库全部会话移入其中（渲染层按 workspaceId 为空禁用其行级交互，
+  // 新建会话经 __dshWorktreeManagerHost 落回真实主 workspace）。
+  for (const [parentId, children] of childrenByParent) {
+    const main = projected.find(workspace => workspace.workspaceId === parentId)
+    if (main === undefined) continue
+    const branch = branchByWorkspaceId[parentId]
+    const virtual: ProjectedWorkspace = {
+      ...main,
+      workspaceId: `${parentId}::dsh-main-worktree`,
+      title: branch ?? 'main',
+      sessionIds: main.sessionIds,
+      __dshWorktreeManagerVirtual: true,
+      __dshWorktreeManagerHost: parentId,
+      __dshWorktreeManagerParent: parentId,
+    }
+    main.sessionIds = []
+    nested.add(virtual.workspaceId)
+    if (branch !== undefined) branchByWorkspaceId[virtual.workspaceId] = branch
+    children.unshift(virtual)
+  }
+
+  const ordered: ProjectedWorkspace[] = []
+  for (const workspace of projected) {
+    if (nested.has(workspace.workspaceId)) continue
+    ordered.push(workspace, ...(childrenByParent.get(workspace.workspaceId) ?? []))
   }
 
   return {
-    workspaces: projected.filter(workspace => !hidden.has(workspace.workspaceId)),
+    workspaces: ordered,
     branchBySessionId,
     branchByWorkspaceId,
-    suppressedSessionIds: suppressed,
+    nestedWorkspaceIds: nested,
   }
 }

@@ -6,10 +6,12 @@
  * bundle），版本 + SHA-256 双重门控（fail-closed：上游升级必须显式换Pin），
  * 然后用精确唯一的字符串 seam 注入：
  *
- * 1. 分支徽标：会话行/搜索行/hover 中渲染所属 worktree 的分支名
- *    （`__dshWorktreeManager` 元数据）；
- * 2. workspace 行分支徽标：group 行渲染 `__dshWorktreeManagerBranch`；
- * 3. 托管会话行禁用拖拽、过滤 fork 菜单（避免把聚合会话拖出/复制出仓库组）。
+ * 1. 嵌套层级：worktree group section 渲染 `__dshWorktreeManagerNested`
+ *    缩进 class，使其成为所属仓库主行下的一个层级；
+ * 2. 分支徽标：workspace 行渲染 `__dshWorktreeManagerBranch`；搜索行与
+ *    hover 卡片渲染会话级 `__dshWorktreeManager` 分支名（会话树行不渲染，
+ *    标题独占整行宽度，分支由所属 worktree 行徽标承担）；
+ * 3. 托管会话行禁用拖拽、过滤 fork 菜单。
  *
  * 最后把官方 ModuleLoader factory 函数体提取出来，包成一个可被 esbuild
  * 内联的 virtual module，仅导出官方的 `apply` / `inject`。
@@ -69,11 +71,11 @@ export function decorateOfficialWorkspaceClient(source) {
   // ---- Workspace group carries the branch label down to the group row ----
   derived = replaceExactlyOnce(derived,
     '\t\t\t\tgroups.push(buildGroup(workspace.workspaceId, workspace.workspaceId, workspace.path, Date.parse(workspace.createdAt), workspace.title, members, "account"));',
-    '\t\t\t\tconst group = buildGroup(workspace.workspaceId, workspace.workspaceId, workspace.path, Date.parse(workspace.createdAt), workspace.title, members, "account");\n\t\t\t\tif (workspace.__dshWorktreeManagerBranch !== void 0) group.__dshWorktreeManagerBranch = workspace.__dshWorktreeManagerBranch;\n\t\t\t\tgroups.push(group);',
+    '\t\t\t\tconst group = buildGroup(workspace.workspaceId, workspace.workspaceId, workspace.path, Date.parse(workspace.createdAt), workspace.title, members, "account");\n\t\t\t\tif (workspace.__dshWorktreeManagerBranch !== void 0) group.__dshWorktreeManagerBranch = workspace.__dshWorktreeManagerBranch;\n\t\t\t\tif (workspace.__dshWorktreeManagerNested === true) group.__dshWorktreeManagerNested = true;\n\t\t\t\tif (workspace.__dshWorktreeManagerParent !== void 0) group.__dshWorktreeManagerParent = workspace.__dshWorktreeManagerParent;\n\t\t\t\tif (workspace.__dshWorktreeManagerVirtual === true) { group.__dshWorktreeManagerVirtual = true; group.__dshWorktreeManagerHost = workspace.__dshWorktreeManagerHost; }\n\t\t\t\tgroups.push(group);',
     'Managed workspace metadata')
   derived = replaceExactlyOnce(derived,
     '\t\t\t\t\tlabel: g.label,\n\t\t\t\t\tsessionCount: g.sessions.length,',
-    '\t\t\t\t\tlabel: g.label,\n\t\t\t\t\t...g.__dshWorktreeManagerBranch === void 0 ? {} : { __dshWorktreeManagerBranch: g.__dshWorktreeManagerBranch },\n\t\t\t\t\tsessionCount: g.sessions.length,',
+    '\t\t\t\t\tlabel: g.label,\n\t\t\t\t\t...g.__dshWorktreeManagerBranch === void 0 ? {} : { __dshWorktreeManagerBranch: g.__dshWorktreeManagerBranch },\n\t\t\t\t\t...g.__dshWorktreeManagerNested === true ? { __dshWorktreeManagerNested: true } : {},\n\t\t\t\t\t...g.__dshWorktreeManagerParent === void 0 ? {} : { __dshWorktreeManagerParent: g.__dshWorktreeManagerParent },\n\t\t\t\t\t...g.__dshWorktreeManagerVirtual === true ? { __dshWorktreeManagerVirtual: true, __dshWorktreeManagerHost: g.__dshWorktreeManagerHost, workspaceId: void 0 } : {},\n\t\t\t\t\tsessionCount: g.sessions.length,',
     'Managed workspace group metadata')
 
   // ---- Session node metadata passthrough (list + search) ----
@@ -112,17 +114,43 @@ export function decorateOfficialWorkspaceClient(source) {
     '\t\t\t\t\t\t\tchildren: (primaryStatus.state !== "done" || result.completed) && (0, react_jsx_runtime.jsx)(SessionStatusDots, { statuses })\n\t\t\t\t\t\t}),\n\t\t\t\t\t\tworktreeDecoration !== void 0 && (0, react_jsx_runtime.jsx)(ManagedWorktreeIdentity, { decoration: worktreeDecoration }),\n\t\t\t\t\t\t(0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\t\tclassName: Rows_module_css_default.searchResultTitle,',
     'search Worktree decoration')
 
-  // ---- Workspace row: branch badge next to the workspace title ----
+  // ---- Workspace row: nested worktree rows render the label as a branch
+  //      identity (icon + pill); top-level rows keep title + trailing badge ----
   derived = replaceExactlyOnce(derived,
     '\t\t\tconst label = row.workspaceId === void 0 ? t("group.ungrouped") : row.label;\n\t\t\tconst active = group.expanded && group.containsCurrent;',
-    '\t\t\tconst label = row.workspaceId === void 0 ? t("group.ungrouped") : row.label;\n\t\t\tconst worktreeBranchDecoration = row.__dshWorktreeManagerBranch;\n\t\t\tconst active = group.expanded && group.containsCurrent;',
+    '\t\t\tconst label = row.__dshWorktreeManagerVirtual === true || row.workspaceId !== void 0 ? row.label : t("group.ungrouped");\n\t\t\tconst worktreeBranchDecoration = row.__dshWorktreeManagerBranch;\n\t\t\tconst worktreeNested = row.__dshWorktreeManagerNested === true;\n\t\t\tconst active = group.expanded && group.containsCurrent;',
     'Managed workspace row metadata')
   derived = replaceExactlyOnce(derived,
     '\t\t\t\t\t(0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\tclassName: Rows_module_css_default.projectText,\n\t\t\t\t\t\tchildren: (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\t\tclassName: Rows_module_css_default.title,\n\t\t\t\t\t\t\tchildren: label\n\t\t\t\t\t\t})\n\t\t\t\t\t}),',
-    '\t\t\t\t\t(0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\tclassName: Rows_module_css_default.projectText,\n\t\t\t\t\t\tchildren: (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\t\tclassName: Rows_module_css_default.title,\n\t\t\t\t\t\t\tchildren: label\n\t\t\t\t\t\t})\n\t\t\t\t\t}),\n\t\t\t\t\tworktreeBranchDecoration !== void 0 && (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\tclassName: "dsh-worktree-manager-sidebar-badge",\n\t\t\t\t\t\t"data-worktree-branch": worktreeBranchDecoration,\n\t\t\t\t\t\ttitle: worktreeBranchDecoration,\n\t\t\t\t\t\t"aria-hidden": "true",\n\t\t\t\t\t\tchildren: worktreeBranchDecoration\n\t\t\t\t\t}),',
+    '\t\t\t\t\tworktreeNested && worktreeBranchDecoration !== void 0\n\t\t\t\t\t\t? (0, react_jsx_runtime.jsx)(ManagedWorktreeIdentity, { decoration: { branch: worktreeBranchDecoration, ariaLabel: worktreeBranchDecoration } })\n\t\t\t\t\t\t: (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\t\tclassName: Rows_module_css_default.projectText,\n\t\t\t\t\t\t\tchildren: (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\t\t\tclassName: Rows_module_css_default.title,\n\t\t\t\t\t\t\t\tchildren: label\n\t\t\t\t\t\t\t})\n\t\t\t\t\t\t}),\n\t\t\t\t\tworktreeBranchDecoration !== void 0 && !worktreeNested && (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\tclassName: "dsh-worktree-manager-sidebar-badge",\n\t\t\t\t\t\t"data-worktree-branch": worktreeBranchDecoration,\n\t\t\t\t\t\ttitle: worktreeBranchDecoration,\n\t\t\t\t\t\t"aria-hidden": "true",\n\t\t\t\t\t\tchildren: worktreeBranchDecoration\n\t\t\t\t\t}),',
     'Managed workspace branch badge')
 
-  // ---- Session rows: decoration capture, fork guard, aria, drag, badge ----
+  // ---- Virtual main-worktree row: "+" creates in the real host workspace ----
+  derived = replaceExactlyOnce(derived,
+    '\t\t\t\t\t\t\t\t\t\tonCreate: () => {\n\t\t\t\t\t\t\t\t\t\t\tif (group.workspaceId !== void 0) {\n\t\t\t\t\t\t\t\t\t\t\t\tsetGroupExpanded(group.key, true);\n\t\t\t\t\t\t\t\t\t\t\t\tstartSession(group.workspaceId);\n\t\t\t\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\t\t\t},',
+    '\t\t\t\t\t\t\t\t\t\tonCreate: () => {\n\t\t\t\t\t\t\t\t\t\t\tconst createTarget = group.__dshWorktreeManagerHost ?? group.workspaceId;\n\t\t\t\t\t\t\t\t\t\t\tif (createTarget !== void 0) {\n\t\t\t\t\t\t\t\t\t\t\t\tsetGroupExpanded(group.key, true);\n\t\t\t\t\t\t\t\t\t\t\t\tstartSession(createTarget);\n\t\t\t\t\t\t\t\t\t\t\t}\n\t\t\t\t\t\t\t\t\t\t},',
+    'virtual Worktree row create')
+
+  // ---- Nested rows follow the parent's collapse: hidden while it is
+  //      collapsed, and expanding the current session's nested group also
+  //      expands its parent so the row stays reachable ----
+  derived = replaceExactlyOnce(derived,
+    '}), groups.map((group) => {',
+    '}), groups.filter((group) => group.__dshWorktreeManagerParent === void 0 || expandedGroups.includes(group.__dshWorktreeManagerParent)).map((group) => {',
+    'nested Worktree collapse filter')
+  derived = replaceExactlyOnce(derived,
+    '\t\t\t(0, react.useEffect)(() => {\n\t\t\t\tif (current === void 0 || currentGroup === void 0 || Object.hasOwn(groupExpansion, currentGroup)) return;\n\t\t\t\tsetGroupExpanded(currentGroup, true);\n\t\t\t}, [',
+    '\t\t\t(0, react.useEffect)(() => {\n\t\t\t\tif (current === void 0 || currentGroup === void 0 || Object.hasOwn(groupExpansion, currentGroup)) return;\n\t\t\t\tsetGroupExpanded(currentGroup, true);\n\t\t\t\tconst parentKey = workspaces.find((w) => w.workspaceId === currentGroup)?.__dshWorktreeManagerParent;\n\t\t\t\tif (parentKey !== void 0 && !Object.hasOwn(groupExpansion, parentKey)) setGroupExpanded(parentKey, true);\n\t\t\t}, [',
+    'nested Worktree parent auto-expand')
+
+  // ---- Nested worktree group: indent the whole section one level ----
+  derived = replaceExactlyOnce(derived,
+    '\t\t\t\t\t\t\t\tclassName: clsx(WorkspaceBrowser_module_css_default.groupSection, workspaceMarker === "before" && WorkspaceBrowser_module_css_default.workspaceDropBefore, workspaceMarker === "after" && WorkspaceBrowser_module_css_default.workspaceDropAfter),',
+    '\t\t\t\t\t\t\t\tclassName: clsx(WorkspaceBrowser_module_css_default.groupSection, workspaceMarker === "before" && WorkspaceBrowser_module_css_default.workspaceDropBefore, workspaceMarker === "after" && WorkspaceBrowser_module_css_default.workspaceDropAfter, group.__dshWorktreeManagerNested === true && "dsh-worktree-manager-nested"),',
+    'nested Worktree group indent')
+
+  // ---- Session rows: decoration capture, fork guard, aria, drag ----
+  // （会话树行不渲染分支徽标：嵌套 worktree 行已承担分支展示，标题独占整行。）
   derived = replaceExactlyOnce(derived,
     '\t\t\tconst showStatus = statuses[0].state !== "done" || row.completed;\n\t\t\tconst [menuOpen, setMenuOpen]',
     '\t\t\tconst showStatus = statuses[0].state !== "done" || row.completed;\n\t\t\tconst worktreeDecoration = managedWorktreeDecoration(row, t);\n\t\t\tconst [menuOpen, setMenuOpen]',
@@ -139,10 +167,6 @@ export function decorateOfficialWorkspaceClient(source) {
     '\t\t\t\t\t"aria-selected": selected,\n\t\t\t\t\tonClick: () => {\n\t\t\t\t\t\tonOpen(node.id);\n\t\t\t\t\t},\n\t\t\t\t\tdraggable: drag !== void 0,',
     '\t\t\t\t\t"aria-selected": selected,\n\t\t\t\t\tonClick: () => {\n\t\t\t\t\t\tonOpen(node.id);\n\t\t\t\t\t},\n\t\t\t\t\tdraggable: worktreeDecoration === void 0 && drag !== void 0,',
     'Managed session drag')
-  derived = replaceExactlyOnce(derived,
-    '\t\t\t\t\t\t(!flat || showStatus) && (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\t\tclassName: Rows_module_css_default.slot,\n\t\t\t\t\t\t\tchildren: showStatus && (0, react_jsx_runtime.jsx)(SessionStatusDots, { statuses })\n\t\t\t\t\t\t}),\n\t\t\t\t\t\t(0, react_jsx_runtime.jsx)("span", {',
-    '\t\t\t\t\t\t(!flat || showStatus) && (0, react_jsx_runtime.jsx)("span", {\n\t\t\t\t\t\t\tclassName: Rows_module_css_default.slot,\n\t\t\t\t\t\t\tchildren: showStatus && (0, react_jsx_runtime.jsx)(SessionStatusDots, { statuses })\n\t\t\t\t\t\t}),\n\t\t\t\t\t\tworktreeDecoration !== void 0 && (0, react_jsx_runtime.jsx)(ManagedWorktreeIdentity, { decoration: worktreeDecoration }),\n\t\t\t\t\t\t(0, react_jsx_runtime.jsx)("span", {',
-    'session Worktree decoration')
   derived = replaceExactlyOnce(derived,
     '\t\t\t\t\t\t\t\titems: sessionMenuItems,',
     '\t\t\t\t\t\t\t\titems: visibleSessionMenuItems,',

@@ -3,9 +3,10 @@
  * 拦截 `sidebar.workspaces` slot 注册，把官方 WorkspaceBrowser 包进投影组件。
  *
  * 与 dsh-git-worktree 的 workspace-sidebar 相同的机制：保留完整的官方
- * Browser（含声明树、locale、picker、目录授权流），只替换数据投影——隐藏
- * worktree 独立行、把其会话聚合进原仓库主行，并为 workspace 行与会话行
- * 附加分支名元数据（由构建期派生的官方渲染层显示为徽标）。
+ * Browser（含声明树、locale、picker、目录授权流），只替换数据投影——把
+ * worktree 行保留为所属仓库主行下的嵌套层级（多一级缩进、会话不再与
+ * worktree 合并为一行），并为 workspace 行与会话附加分支名元数据
+ * （由构建期派生的官方渲染层显示为徽标）。
  */
 import { useEffect, useMemo, useState, type ComponentType } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
@@ -29,8 +30,9 @@ interface WorkspaceListState {
 }
 
 /**
- * 渲染官方 Browser，仅替换数据源：workspace 列表过滤隐藏行并合并会话；
- * 会话列表抑制 blank 并附加 `__dshWorktreeManager` 分支元数据。
+ * 渲染官方 Browser，仅替换数据源：workspace 列表把 worktree 行排序为
+ * 所属仓库主行的嵌套子级并附加 `__dshWorktreeManagerNested` 标记；会话
+ * 列表附加 `__dshWorktreeManager` 分支元数据（搜索行/hover 卡片徽标）。
  */
 export function ManagedOfficialWorkspaceBrowser(
   props: Record<string, unknown> & { OfficialBrowser: ComponentType<Record<string, unknown>> },
@@ -65,25 +67,30 @@ export function ManagedOfficialWorkspaceBrowser(
     ...workspaceState,
     items: projection.workspaces.map(workspace => {
       const branch = projection.branchByWorkspaceId[workspace.workspaceId]
+      if (projection.nestedWorkspaceIds.has(workspace.workspaceId)) {
+        // 嵌套行直接以 worktree 分支名作为标题（不显示目录名）；分支元数据
+        // 一并透传，派生渲染层把它渲染成分支徽标样式（图标 + pill）。
+        return {
+          ...workspace,
+          title: branch ?? workspace.title,
+          __dshWorktreeManagerNested: true,
+          ...(branch === undefined ? {} : { __dshWorktreeManagerBranch: branch }),
+        }
+      }
       return branch === undefined ? workspace : { ...workspace, __dshWorktreeManagerBranch: branch }
     }),
   }), [projection, workspaceState])
 
   const projectedSessionState = useMemo<SidebarSessionListState>(() => {
     const byId: Record<string, SidebarSessionListState['byId'][string]> = { ...sessionState.byId }
-    for (const sessionId of projection.suppressedSessionIds) delete byId[sessionId]
     for (const [sessionId, branch] of Object.entries(projection.branchBySessionId)) {
       const summary = byId[sessionId]
       if (summary === undefined) continue
-      // 保留规范标题不动：派生的官方渲染层把该元数据显示为标题前的
-      // 固定 icon + 分支徽标。
+      // 保留规范标题不动：派生的官方渲染层把该元数据显示在搜索结果行与
+      // hover 卡片（会话树行的分支由所属 worktree 行徽标承担）。
       byId[sessionId] = { ...summary, __dshWorktreeManager: { branch } } as typeof summary
     }
-    return {
-      ...sessionState,
-      ids: sessionState.ids.filter(sessionId => !projection.suppressedSessionIds.has(sessionId)),
-      byId,
-    }
+    return { ...sessionState, byId }
   }, [projection, sessionState])
 
   const useProjectedWorkspaces = (<T,>(selector: (state: WorkspaceListState) => T): T =>

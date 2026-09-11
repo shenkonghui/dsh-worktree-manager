@@ -6,9 +6,10 @@
  * 1. **Managed workspace sidebar** (official client proxy): re-applies the
  *    version/hash-gated official Workspace Client through a proxied context,
  *    swapping its Browser component for the managed projection — worktree
- *    workspaces are hidden and their sessions aggregated under the owning
- *    repository's workspace row, with branch badges on both workspace and
- *    session rows. See ./workspace-sidebar.
+ *    workspaces stay visible as an indented level under the owning
+ *    repository's workspace row, sessions keep full-width titles inside
+ *    their own worktree row, and workspace rows carry branch badges.
+ *    See ./workspace-sidebar.
  *
  * 2. **Task-start-window Worktree button + 视图选项菜单项** (DOM injection):
  *    a MutationObserver injects a "Worktree" button beside the workspace
@@ -110,11 +111,17 @@ function injectStyles(): void {
   style.textContent = `
 .dsh-wt-inject-btn {
   display: inline-flex; align-items: center; gap: 4px;
-  height: 28px; padding: 0 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+  height: 28px; padding: 0 6px 0 8px; border-radius: 6px; cursor: pointer; font-size: 13px;
   border: none !important; outline: none !important; background: transparent;
   color: var(--dsh-fg, inherit); flex: none;
 }
 .dsh-wt-inject-btn:hover { background: var(--dsh-hover, rgba(0,0,0,0.05)); }
+.dsh-wt-inject-btn .dsh-wt-icon { display: inline-flex; flex: none; }
+.dsh-wt-inject-btn .dsh-wt-caret {
+  display: inline-flex; flex: none; opacity: 0.6;
+  transition: transform 0.15s ease;
+}
+.dsh-wt-inject-btn[data-open="true"] .dsh-wt-caret { transform: rotate(180deg); }
 .dsh-wt-dropdown {
   position: fixed; z-index: 10000; min-width: 280px; max-width: 480px;
   max-height: 360px; overflow-y: auto;
@@ -136,7 +143,6 @@ function injectStyles(): void {
 .dsh-wt-dropdown-item:hover { background: var(--dsh-hover, rgba(0,0,0,0.05)); }
 .dsh-wt-dropdown-item-info { flex: 1; min-width: 0; }
 .dsh-wt-dropdown-item-path { font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.dsh-wt-dropdown-item-branch { font-size: 11px; opacity: 0.6; }
 .dsh-wt-dropdown-item-badge {
   font-size: 10px; padding: 1px 5px; border-radius: 3px;
   background: var(--dsh-badge, rgba(0,0,0,0.1)); flex: none;
@@ -163,19 +169,13 @@ function injectStyles(): void {
 }
 .dsh-wt-repo-group { border-bottom: 1px solid var(--dsh-border, rgba(0,0,0,0.06)); }
 .dsh-wt-repo-group:last-child { border-bottom: none; }
-.dsh-wt-repo-header {
-  display: flex; align-items: center; gap: 6px;
-  padding: 6px 12px; cursor: pointer; font-size: 12px; font-weight: 600;
-  background: var(--dsh-hover, rgba(0,0,0,0.03)); user-select: none;
-}
-.dsh-wt-repo-header:hover { background: var(--dsh-hover, rgba(0,0,0,0.06)); }
-.dsh-wt-repo-toggle { font-size: 10px; opacity: 0.5; flex: none; width: 12px; }
-.dsh-wt-repo-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dsh-wt-repo-count { font-size: 10px; opacity: 0.5; flex: none; font-weight: 400; }
-.dsh-wt-repo-body { display: none; }
-.dsh-wt-repo-body.open { display: block; }
 .dsh-wt-repo-empty { padding: 8px 12px; font-size: 11px; opacity: 0.5; }
-.dsh-wt-dropdown-create select.dsh-wt-dropdown-input { flex: none; width: auto; min-width: 120px; }
+/* Nested worktree group：相对仓库主行多一级缩进 + 左侧层级引导线 */
+.dsh-worktree-manager-nested {
+  margin-left: 12px;
+  padding-left: 6px;
+  border-left: 1px solid var(--dsh-border, rgba(0,0,0,0.08));
+}
 /* Sidebar branch badges（对齐 dsh-git-worktree 状态徽标的视觉：accent 色字 + 色底 + 色边框 pill） */
 .dsh-worktree-manager-sidebar-icon,
 .dsh-worktree-manager-sidebar-badge { flex: 0 1 auto; min-width: 0; }
@@ -298,8 +298,8 @@ function normalizePathKey(value: string): string {
 /**
  * Ensure a workspace exists for the given path, then enter it by creating (or
  * reusing) a blank session in that workspace and opening it — the session then
- * appears as a session of the owning repository's workspace row in the sidebar
- * projection, even though the standalone worktree row is hidden.
+ * appears under the worktree's own row, nested as an indented level beneath
+ * the owning repository's workspace row in the sidebar projection.
  */
 async function ensureAndSwitchWorkspace(path: string): Promise<void> {
   if (sessionsService === undefined) {
@@ -344,6 +344,7 @@ function closeDropdown(): void {
     activeDropdown.remove()
     activeDropdown = null
   }
+  document.querySelector(`[${INJECT_MARKER}]`)?.removeAttribute('data-open')
   document.removeEventListener('click', onDocClick)
 }
 
@@ -356,6 +357,7 @@ function onDocClick(e: MouseEvent): void {
 /** Show the worktree dropdown anchored above the trigger button. */
 async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   closeDropdown()
+  trigger.setAttribute('data-open', 'true')
   injectStyles()
 
   const rect = trigger.getBoundingClientRect()
@@ -391,9 +393,10 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     return
   }
 
-  // 2. Detect current workspace path to decide which repo expands by default.
-  // The workspace chip button carries a stable aria-label (zh/en) and its
-  // text content is the current workspace title.
+  // 2. Detect the workspace selected on the left (the workspace chip shows
+  // its title); only that workspace's repo contributes worktrees. The chip
+  // carries a stable aria-label (zh/en) and its visible label span holds the
+  // workspace title.
   const wsItems = listWorkspaces()
   let currentName = ''
   for (const label of WORKSPACE_CHIP_LABELS) {
@@ -401,20 +404,39 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
       `button[aria-haspopup="menu"][aria-label="${label}"]`,
     )
     if (wsBtn) {
-      // The chip's visible label span holds the workspace title; the button
-      // text also includes the aria-label text, so strip it.
       const labelSpan = wsBtn.querySelector('span')
       currentName = (labelSpan?.textContent ?? wsBtn.textContent ?? '').trim()
       break
     }
   }
-  const currentWs = wsItems.find(it => it.title === currentName) ?? null
-  // The repo whose root contains the current workspace path is expanded by default
-  const currentRepoRoot = currentWs
+  let currentWs = wsItems.find(it => it.title === currentName) ?? null
+  if (currentWs === null) {
+    // Fallback: locate the workspace via the current session's cwd.
+    try {
+      const snap = sessionsService?.list.getSnapshot()
+      const cwd = snap?.current !== undefined ? snap.byId[snap.current]?.cwd : undefined
+      if (cwd !== undefined) {
+        currentWs = wsItems.find(it => cwd === it.path || cwd.startsWith(it.path + '/')) ?? null
+      }
+    } catch { /* 快照不可用时按未选中处理 */ }
+  }
+  const currentRepoRoot = currentWs !== null
     ? repos.find(r => currentWs.path === r.root || currentWs.path.startsWith(r.root + '/'))?.root ?? null
     : null
 
-  // 3. Concurrently load worktrees for every discovered repo
+  // Scope to the selected workspace's repo; fall back to all repos only when
+  // no workspace selection could be detected at all.
+  const targetRepos = currentRepoRoot !== null
+    ? repos.filter(r => r.root === currentRepoRoot)
+    : currentWs === null ? repos : []
+
+  if (targetRepos.length === 0) {
+    dropdown.innerHTML = ''
+    dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: '当前工作区不属于任何 git 仓库' }))
+    return
+  }
+
+  // 3. Load worktrees for the target repo(s)
   dropdown.innerHTML = ''
   dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '正在加载 worktree 列表…' }))
 
@@ -424,7 +446,7 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     error?: string
   }
   const loaded: RepoWithWorktrees[] = await Promise.all(
-    repos.map(async r => {
+    targetRepos.map(async r => {
       try {
         const listRes = await apiGet('list', { repoPath: r.root }) as ListResponse
         return { repo: r, worktrees: listRes.worktrees }
@@ -435,18 +457,11 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     }),
   )
 
-  // Stable order: current repo first, then by root path
-  loaded.sort((a, b) => {
-    if (a.repo.root === currentRepoRoot) return -1
-    if (b.repo.root === currentRepoRoot) return 1
-    return a.repo.root.localeCompare(b.repo.root)
-  })
-
   // 4. Render grouped list with search filter
   dropdown.innerHTML = ''
 
   const totalWorktrees = loaded.reduce((n, g) => n + g.worktrees.length, 0)
-  const headerText = `${repos.length} 个仓库 · ${totalWorktrees} 个 worktree`
+  const headerText = `${loaded.length} 个仓库 · ${totalWorktrees} 个 worktree`
   dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-header', text: headerText }))
 
   // Search input
@@ -476,67 +491,41 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
         return name.includes(lower) || branch.includes(lower) || wt.path.toLowerCase().includes(lower)
       })
 
-      // When filtering, hide repos with no matches; otherwise show all (even empty)
-      if (hasFilter && filtered.length === 0) continue
+      if (filtered.length === 0 && group.error === undefined) continue
       totalShown += filtered.length
 
       const groupEl = el('div', { class: 'dsh-wt-repo-group' })
-      const header = el('div', { class: 'dsh-wt-repo-header' })
-      // Expand current repo by default; when filtering, expand all
-      const expanded = hasFilter || group.repo.root === currentRepoRoot
-      const toggle = el('span', { class: 'dsh-wt-repo-toggle', text: expanded ? '▼' : '▶' })
-      header.appendChild(toggle)
-      header.appendChild(el('span', { class: 'dsh-wt-repo-name', text: group.repo.name, title: group.repo.root }))
-      const countText = group.error
-        ? '加载失败'
-        : `${filtered.length} 个 worktree`
-      header.appendChild(el('span', { class: 'dsh-wt-repo-count', text: countText }))
-      groupEl.appendChild(header)
 
-      const body = el('div', { class: `dsh-wt-repo-body${expanded ? ' open' : ''}` })
-
-      if (group.error) {
-        body.appendChild(el('div', { class: 'dsh-wt-repo-empty', text: group.error }))
-      } else if (filtered.length === 0) {
-        body.appendChild(el('div', { class: 'dsh-wt-repo-empty', text: '无 worktree' }))
-      } else {
-        for (const wt of filtered) {
-          const item = el('button', { class: 'dsh-wt-dropdown-item' })
-          const info = el('div', { class: 'dsh-wt-dropdown-item-info' })
-          info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-path', text: basename(wt.path), title: wt.path }))
-          const branchText = wt.branch ? wt.branch : `HEAD: ${wt.head.slice(0, 8)}`
-          info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-branch', text: branchText }))
-          item.appendChild(info)
-          const badges: string[] = []
-          if (wt.bare) badges.push('bare')
-          if (wt.locked) badges.push('locked')
-          if (wt.prunable) badges.push('prunable')
-          for (const badge of badges) {
-            item.appendChild(el('span', { class: 'dsh-wt-dropdown-item-badge', text: badge }))
-          }
-          item.onclick = async (e: MouseEvent) => {
-            e.stopPropagation()
-            item.setAttribute('disabled', 'disabled')
-            try {
-              await ensureAndSwitchWorkspace(wt.path)
-              closeDropdown()
-            } catch (err) {
-              item.removeAttribute('disabled')
-              const msg = err instanceof Error ? err.message : String(err)
-              dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: msg }))
-            }
-          }
-          body.appendChild(item)
+      if (group.error !== undefined) {
+        groupEl.appendChild(el('div', { class: 'dsh-wt-repo-empty', text: group.error }))
+      }
+      for (const wt of filtered) {
+        const item = el('button', { class: 'dsh-wt-dropdown-item' })
+        const info = el('div', { class: 'dsh-wt-dropdown-item-info' })
+        info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-path', text: basename(wt.path), title: wt.path }))
+        item.appendChild(info)
+        const badges: string[] = []
+        if (wt.bare) badges.push('bare')
+        if (wt.locked) badges.push('locked')
+        if (wt.prunable) badges.push('prunable')
+        for (const badge of badges) {
+          item.appendChild(el('span', { class: 'dsh-wt-dropdown-item-badge', text: badge }))
         }
+        item.onclick = async (e: MouseEvent) => {
+          e.stopPropagation()
+          item.setAttribute('disabled', 'disabled')
+          try {
+            await ensureAndSwitchWorkspace(wt.path)
+            closeDropdown()
+          } catch (err) {
+            item.removeAttribute('disabled')
+            const msg = err instanceof Error ? err.message : String(err)
+            dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: msg }))
+          }
+        }
+        groupEl.appendChild(item)
       }
 
-      header.onclick = (e: MouseEvent) => {
-        e.stopPropagation()
-        const isOpen = body.classList.toggle('open')
-        toggle.textContent = isOpen ? '▼' : '▶'
-      }
-
-      groupEl.appendChild(body)
       listContainer.appendChild(groupEl)
     }
 
@@ -549,15 +538,8 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   searchBox.onclick = (e: MouseEvent) => e.stopPropagation()
   renderList('')
 
-  // 5. Create-new-worktree row (target repo selectable, defaults to current repo)
+  // 5. Create-new-worktree row (targets the selected workspace's repo)
   const createRow = el('div', { class: 'dsh-wt-dropdown-create' })
-  const repoSelect = el('select', { class: 'dsh-wt-dropdown-input' })
-  for (const g of loaded) {
-    const opt = el('option', { value: g.repo.root, text: g.repo.name })
-    if (g.repo.root === currentRepoRoot) opt.setAttribute('selected', 'selected')
-    repoSelect.appendChild(opt)
-  }
-  createRow.appendChild(repoSelect)
   const branchInput = el('input', {
     class: 'dsh-wt-dropdown-input',
     placeholder: '新分支名 (如 feature/xxx)',
@@ -568,7 +550,7 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     e.stopPropagation()
     const branch = branchInput.value.trim()
     if (!branch) return
-    const repoPath = repoSelect.value
+    const repoPath = currentRepoRoot ?? loaded[0].repo.root
     createBtn.setAttribute('disabled', 'disabled')
     try {
       const result = await apiPost('create', {
@@ -620,6 +602,12 @@ function findWorkspaceWriteAnchor(): HTMLElement | null {
   return null
 }
 
+/** Left worktree glyph (same mark as the sidebar footer panel trigger). */
+const WT_ICON_SVG = '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M2 4h5v8H2zM7 6h3v6H7zM10 3h4v9h-4z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>'
+
+/** Right dropdown caret; rotates open via [data-open="true"]. */
+const WT_CARET_SVG = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true"><path d="M2.5 3.75 5 6.25 7.5 3.75" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+
 /** Inject the "Worktree" button to the right of the Workspace Write button. */
 function injectWorktreeButton(): void {
   if (document.querySelector(`[${INJECT_MARKER}]`)) return
@@ -633,8 +621,8 @@ function injectWorktreeButton(): void {
   const btn = el('button', {
     class: 'dsh-wt-inject-btn',
     [INJECT_MARKER]: 'true',
-    text: 'Worktree',
   })
+  btn.innerHTML = `<span class="dsh-wt-icon">${WT_ICON_SVG}</span><span>Worktree</span><span class="dsh-wt-caret">${WT_CARET_SVG}</span>`
   btn.onclick = (e: MouseEvent) => {
     e.stopPropagation()
     if (activeDropdown) {
