@@ -35,6 +35,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
     "build:client": "node scripts/build-client.mjs",
+    "check:lib": "node scripts/check-lib.mjs",
     "typecheck:client": "tsc -p tsconfig.client.json"
   },
   "license": "MIT",

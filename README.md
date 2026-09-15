@@ -55,10 +55,16 @@ The client communicates with the host through `fetch()` calls to the custom HTTP
 
 ## Install
 
-Build and install the package into the harness environment, then start the web UI:
+从 git 源直接安装即可——仓库已提交构建产物 `lib/`，安装过程中不做任何编译，也不需要 `allowBuilds` 构建授权：
 
 ```sh
-pnpm build
+dsh plugin --profile web add github:shenkonghui/dsh-worktree-manager
+```
+
+也可以从本地检出构建后安装，再启动 Web UI：
+
+```sh
+npm run build
 npm install <path-to-this-package>
 npx @deepseek-ai/dsh web
 ```
@@ -66,6 +72,17 @@ npx @deepseek-ai/dsh web
 The harness discovers the plugin from the `dsh` manifest field and:
 - Loads the host half as a Cordis plugin (registers HTTP routes)
 - Injects the client bundle at boot (`immediately: true`)
+
+### 产物维护
+
+`lib/` 已纳入版本控制（`.gitignore` 不再忽略它），这正是 git 源安装能免构建的原因。代价是：**改动 `src/` 后必须重新构建并连同 `lib/` 一起提交**，否则远程仓库会停留在旧产物上。
+
+```sh
+npm run build      # 重建 lib/（host 半 tsc 输出 + client 半 esbuild 打包）
+npm run check:lib  # 把源码重建到临时目录，与入库产物逐字节比对
+```
+
+`npm run check:lib` 在产物缺失、多余或内容不同时以非零码退出并列出差异文件，用来在提交前拦住漂移。
 
 ## Usage
 

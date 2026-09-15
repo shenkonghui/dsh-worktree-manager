@@ -16,7 +16,7 @@
  * `module`/`exports` are local bindings the CJS body writes into.
  */
 import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import {
@@ -101,7 +101,12 @@ let code = result.outputFiles[0].text;
 // the directive is noisy inside the wrapper.
 code = code.replace(/^"use strict";\s*\n/gm, "");
 
-const target = fileURLToPath(new URL("../lib/client/index.js", import.meta.url));
+// 可选参数：输出根目录。默认写回包内 lib/；校验脚本会传入临时目录，
+// 以便把重建结果与已入库的产物逐字节比对。
+const outRoot = process.argv[2]
+	? resolve(process.argv[2])
+	: fileURLToPath(new URL("../lib", import.meta.url));
+const target = join(outRoot, "client/index.js");
 mkdirSync(dirname(target), { recursive: true });
 writeFileSync(target, code);
-console.log(`${PLUGIN_ID}: bundled client (loader format)`);
+console.log(`${PLUGIN_ID}: bundled client (loader format) -> ${target}`);
