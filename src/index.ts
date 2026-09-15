@@ -324,8 +324,8 @@ interface RepoTopology {
   name: string
   /** 主工作树（path === root）当前分支；detached HEAD 时缺省。 */
   mainBranch?: string
-  /** 非主 worktree 列表（含各自分支）。 */
-  worktrees: Array<{ path: string; branch?: string }>
+  /** 非主 worktree 列表（含各自分支与合并状态）。 */
+  worktrees: Array<{ path: string; branch?: string; merged?: boolean }>
   /** 注册在该仓库下的 dsh workspace id（主 + worktree）。 */
   workspaceIds: string[]
 }
@@ -336,11 +336,76 @@ interface TopologyResponse {
 }
 
 /**
+ * 列出仓库内已完全合并到 baseRef 的本地分支（其 tip 可从 baseRef 到达）。
+ * baseRef 不存在时返回 undefined —— 调用方据此保持「未知」而不是报告未合并。
+ * 导出供自检脚本使用。
+ */
+export async function mergedBranchesInto(
+  root: string,
+  baseRef: string,
+): Promise<Set<string> | undefined> {
+  try {
+    const out = await runGit(root, ['branch', '--merged', baseRef, '--format=%(refname:short)'])
+    return new Set(out.split('\n').filter(line => line !== ''))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * detached HEAD 的 worktree 无法用 {@link mergedBranchesInto} 的分支集合判定，
+ * 改为单点判断其 HEAD 提交是否可从 baseRef 到达。导出供自检脚本使用。
+ */
+export async function headMergedInto(
+  root: string,
+  baseRef: string,
+  head: string,
+): Promise<boolean> {
+  try {
+    await runGit(root, ['merge-base', '--is-ancestor', head, baseRef])
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 把仓库的 linked worktree 转成拓扑行，并为每行判定 `merged`。基准分支或分支
+ * 集合不可用时省略该字段（保持「未知」，客户端维持原有配色）——绝不因为判定
+ * 不出来就把 worktree 标成未合并。导出供自检脚本使用。
+ */
+export async function worktreeRows(
+  root: string,
+  baseRef: string | undefined,
+  mergedBranches: Set<string> | undefined,
+  linked: Array<{ path: string; wt: WorktreeInfo }>,
+): Promise<RepoTopology['worktrees']> {
+  return Promise.all(linked.map(async entry => {
+    const branch = entry.wt.branch
+    const merged = baseRef === undefined || mergedBranches === undefined
+      ? undefined
+      : branch === undefined
+        // detached HEAD 没有分支名，用 HEAD 提交做单点祖先判定。
+        ? await headMergedInto(root, baseRef, entry.wt.head)
+        : mergedBranches.has(branch)
+    return {
+      path: entry.path,
+      ...(branch === undefined ? {} : { branch }),
+      ...(merged === undefined ? {} : { merged }),
+    }
+  }))
+}
+
+/**
  * Build the sidebar projection topology: for every registered dsh workspace
  * grouped under its git repository root, expose the main branch, the linked
  * worktree paths with their branches, and the workspace ids living under the
  * repository. The client projection uses this to aggregate worktree sessions
  * under the repository's main workspace row and to label branch names.
+ *
+ * 每个 worktree 还带一个 `merged` 标记：其分支（或 detached HEAD）是否已完全
+ * 合并到基准分支。基准取仓库主工作树当前检出的分支——即「是否已合回主干」的
+ * 语义，主干自身不参与判定。基准不存在（主工作树 detached HEAD）时省略该字段。
  */
 async function handleTopology(ctx: Context): Promise<TopologyResponse> {
   const workspaces = ctx.workspaceRegistry.list()
@@ -377,16 +442,17 @@ async function handleTopology(ctx: Context): Promise<TopologyResponse> {
       path: await realpath(wt.path).catch(() => wt.path),
     })))
     const main = canonical.find(entry => entry.path === group.root)
+    const mainBranch = main?.wt.branch
+    // 一次 `git branch --merged` 覆盖整仓的分支级判定。
+    const mergedBranches = mainBranch === undefined
+      ? undefined
+      : await mergedBranchesInto(group.root, mainBranch)
+    const linked = canonical.filter(entry => entry !== main && !entry.wt.bare)
     repos.push({
       root: group.root,
       name: group.name,
-      ...(main?.wt.branch === undefined ? {} : { mainBranch: main.wt.branch }),
-      worktrees: canonical
-        .filter(entry => entry !== main && !entry.wt.bare)
-        .map(entry => ({
-          path: entry.path,
-          ...(entry.wt.branch === undefined ? {} : { branch: entry.wt.branch }),
-        })),
+      ...(mainBranch === undefined ? {} : { mainBranch }),
+      worktrees: await worktreeRows(group.root, mainBranch, mergedBranches, linked),
       workspaceIds: group.workspaceIds,
     })
   }

@@ -84,6 +84,15 @@ npm run check:lib  # 把源码重建到临时目录，与入库产物逐字节�
 
 `npm run check:lib` 在产物缺失、多余或内容不同时以非零码退出并列出差异文件，用来在提交前拦住漂移。
 
+### 自检脚本
+
+两个脚本都读 `lib/` 产物，所以要在 `npm run build` 之后跑：
+
+```sh
+node scripts/changes-self-check.mjs   # 「变更」视图的 git 管线（status/diff-tree/submodule）
+node scripts/merge-self-check.mjs     # worktree 合并状态判定（分支级快查 + detached HEAD 单点判定）
+```
+
 ## Usage
 
 1. Start the dsh web UI
@@ -94,6 +103,18 @@ npm run check:lib  # 把源码重建到临时目录，与入库产物逐字节�
 6. **To create a new worktree**: choose a target repository from the selector (defaults to the current repo), type a new branch name, and click "创建"
 
 The selected/created worktree directory is registered as a dsh workspace and the sidebar switches to it.
+
+### 合并状态配色
+
+分组开启后，侧边栏里每个 worktree 行的分支徽标会体现它是否已经合回主干：
+
+- **基准分支** = 该仓库主工作树当前检出的分支（`/api/topology` 的 `mainBranch`）。主工作树自身是基准，不参与判定，保持蓝色。
+- **判定方式** = 该 worktree 分支的 tip 是否可从基准到达，即完全合并（`git branch --merged <base>`）；detached HEAD 的 worktree 改用其 HEAD 提交做单点祖先判定（`git merge-base --is-ancestor`）。合并后又有新提交的算未合并。
+- **绿色** = 已合并到基准；**蓝色** = 未合并。
+- 徽标的 hover 提示会写明 `已合并到 <基准>` / `未合并到 <基准>`。
+- 判不出来时（基准不存在，例如主工作树处于 detached HEAD）不在 `/api/topology` 的 worktree 行上给 `merged` 字段：徽标保持蓝色，但提示只显示分支名，不会被误报成「未合并」。
+
+判定在宿主侧完成（`/api/topology` 的 `worktrees[].merged`），客户端只负责取色，因此拓扑刷新时状态会一起更新。
 
 ## API Reference
 

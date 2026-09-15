@@ -56,6 +56,58 @@ interface Context {
 export declare const name = "dsh-worktree-manager";
 /** Required services: the HTTP carrier, the bash executor, and the workspace registry. */
 export declare const inject: readonly ["webServer", "shell", "workspaceRegistry"];
+/** One parsed worktree row from `git worktree list --porcelain`. */
+interface WorktreeInfo {
+    /** Absolute path of the working tree. */
+    path: string;
+    /** HEAD commit hash (detached) or branch ref. */
+    head: string;
+    /** Branch name when checked out, absent when detached. */
+    branch?: string;
+    /** Whether this is the main working tree. */
+    bare: boolean;
+    /** Whether the worktree is locked. */
+    locked: boolean;
+    /** Whether the worktree is prunable. */
+    prunable: boolean;
+}
+/** 每个仓库的侧边栏投影拓扑：分支归属与 workspace 归属。 */
+interface RepoTopology {
+    /** 规范化 git 仓库根（与 {@link RepoGroup.root} 语义一致）。 */
+    root: string;
+    /** 展示名（根路径 basename）。 */
+    name: string;
+    /** 主工作树（path === root）当前分支；detached HEAD 时缺省。 */
+    mainBranch?: string;
+    /** 非主 worktree 列表（含各自分支与合并状态）。 */
+    worktrees: Array<{
+        path: string;
+        branch?: string;
+        merged?: boolean;
+    }>;
+    /** 注册在该仓库下的 dsh workspace id（主 + worktree）。 */
+    workspaceIds: string[];
+}
+/**
+ * 列出仓库内已完全合并到 baseRef 的本地分支（其 tip 可从 baseRef 到达）。
+ * baseRef 不存在时返回 undefined —— 调用方据此保持「未知」而不是报告未合并。
+ * 导出供自检脚本使用。
+ */
+export declare function mergedBranchesInto(root: string, baseRef: string): Promise<Set<string> | undefined>;
+/**
+ * detached HEAD 的 worktree 无法用 {@link mergedBranchesInto} 的分支集合判定，
+ * 改为单点判断其 HEAD 提交是否可从 baseRef 到达。导出供自检脚本使用。
+ */
+export declare function headMergedInto(root: string, baseRef: string, head: string): Promise<boolean>;
+/**
+ * 把仓库的 linked worktree 转成拓扑行，并为每行判定 `merged`。基准分支或分支
+ * 集合不可用时省略该字段（保持「未知」，客户端维持原有配色）——绝不因为判定
+ * 不出来就把 worktree 标成未合并。导出供自检脚本使用。
+ */
+export declare function worktreeRows(root: string, baseRef: string | undefined, mergedBranches: Set<string> | undefined, linked: Array<{
+    path: string;
+    wt: WorktreeInfo;
+}>): Promise<RepoTopology['worktrees']>;
 /** One changed path from `git status --porcelain=v2`. */
 interface ChangeFile {
     /** Two-letter XY status code; `??` marks untracked. */

@@ -6,7 +6,8 @@
  * Browser（含声明树、locale、picker、目录授权流），只替换数据投影——把
  * worktree 行保留为所属仓库主行下的嵌套层级（多一级缩进、会话不再与
  * worktree 合并为一行），并为 workspace 行与会话附加分支名元数据
- * （由构建期派生的官方渲染层显示为徽标）。
+ * （由构建期派生的官方渲染层显示为徽标）；linked worktree 行额外携带是否已
+ * 合并到基准分支，渲染层据此把分支徽标染绿（未合并/未知保持蓝色）。
  */
 import { useEffect, useMemo, useState, type ComponentType } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
@@ -67,6 +68,15 @@ export function ManagedOfficialWorkspaceBrowser(
     ...workspaceState,
     items: projection.workspaces.map(workspace => {
       const branch = projection.branchByWorkspaceId[workspace.workspaceId]
+      const merge = projection.mergeByWorkspaceId[workspace.workspaceId]
+      // 合并状态透传给派生的官方渲染层：merged 为 true 时把分支徽标染绿，
+      // 提示文案说明是与哪个基准分支比较（未合并/未知保持原有 accent 蓝）。
+      const mergeFields = merge === undefined ? {} : {
+        __dshWorktreeManagerMerged: merge.merged,
+        __dshWorktreeManagerMergeLabel: merge.merged
+          ? `已合并到 ${merge.base}`
+          : `未合并到 ${merge.base}`,
+      }
       if (projection.nestedWorkspaceIds.has(workspace.workspaceId)) {
         // 嵌套行直接以 worktree 分支名作为标题（不显示目录名）；分支元数据
         // 一并透传，派生渲染层把它渲染成分支徽标样式（图标 + pill）。
@@ -75,9 +85,14 @@ export function ManagedOfficialWorkspaceBrowser(
           title: branch ?? workspace.title,
           __dshWorktreeManagerNested: true,
           ...(branch === undefined ? {} : { __dshWorktreeManagerBranch: branch }),
+          ...mergeFields,
         }
       }
-      return branch === undefined ? workspace : { ...workspace, __dshWorktreeManagerBranch: branch }
+      return {
+        ...workspace,
+        ...(branch === undefined ? {} : { __dshWorktreeManagerBranch: branch }),
+        ...mergeFields,
+      }
     }),
   }), [projection, workspaceState])
 

@@ -12,6 +12,8 @@
  *   挂到包含它的最内层 workspace 行；
  * - 为主行与顶层 worktree 行标注分支名（渲染为徽标）；嵌套 worktree 行
  *   直接以分支名作为标题；会话级分支元数据仅供搜索结果行与 hover 卡片；
+ * - 为 linked worktree 行标注是否已合并到基准分支（= 仓库主工作树当前检出的
+ *   分支），渲染层据此把分支徽标染绿、未合并或未能判定时保持蓝色；
  * - 归属无法证明时 fail-open：worktree 行就地保留为顶层行，绝不隐藏会话。
  */
 
@@ -47,13 +49,22 @@ export interface SidebarTopologyRepo {
   root: string
   name: string
   mainBranch?: string
-  worktrees: ReadonlyArray<{ path: string; branch?: string }>
+  /** 非主 worktree 列表；`merged` 缺省表示宿主未能判定（保持原有配色）。 */
+  worktrees: ReadonlyArray<{ path: string; branch?: string; merged?: boolean }>
   workspaceIds: readonly string[]
 }
 
 /** GET /api/topology 的响应体。 */
 export interface SidebarTopology {
   repos: readonly SidebarTopologyRepo[]
+}
+
+/** worktree 行的合并状态：徽标染绿 + 提示文案。 */
+export interface WorktreeMergeStatus {
+  /** 是否已完全合并到基准分支。 */
+  merged: boolean
+  /** 基准分支名（仓库主工作树当前检出的分支）。 */
+  base: string
 }
 
 /** 投影结果：投影后的 workspace 行 + 分支标注 + 嵌套子级标记。 */
@@ -64,6 +75,8 @@ export interface ManagedSidebarProjection {
   branchBySessionId: Readonly<Record<string, string>>
   /** workspace 行分支徽标（主行 + worktree 行）。 */
   branchByWorkspaceId: Readonly<Record<string, string>>
+  /** linked worktree 行的合并状态（仓库主行与虚拟主行不含在内）。 */
+  mergeByWorkspaceId: Readonly<Record<string, WorktreeMergeStatus>>
   /** 渲染为所属仓库主行下一级（缩进）的 worktree 行。 */
   nestedWorkspaceIds: ReadonlySet<string>
 }
@@ -144,17 +157,32 @@ export function projectManagedSidebar(input: {
   }))
   const branchBySessionId: Record<string, string> = {}
   const branchByWorkspaceId: Record<string, string> = {}
+  const mergeByWorkspaceId: Record<string, WorktreeMergeStatus> = {}
   const nested = new Set<string>()
 
   if (input.topology.repos.length === 0) {
-    return { workspaces: projected, branchBySessionId, branchByWorkspaceId, nestedWorkspaceIds: nested }
+    return {
+      workspaces: projected,
+      branchBySessionId,
+      branchByWorkspaceId,
+      mergeByWorkspaceId,
+      nestedWorkspaceIds: nested,
+    }
   }
 
   // 拓扑 → 查找表：worktree 路径归属 + 每个仓库的主 workspace 行。
-  const worktreeByPath = new Map<string, { repoRoot: string; branch?: string }>()
+  const worktreeByPath = new Map<
+    string,
+    { repoRoot: string; branch?: string; merged?: boolean; base?: string }
+  >()
   for (const repo of input.topology.repos) {
     for (const wt of repo.worktrees) {
-      worktreeByPath.set(normalizePath(wt.path), { repoRoot: repo.root, branch: wt.branch })
+      worktreeByPath.set(normalizePath(wt.path), {
+        repoRoot: repo.root,
+        branch: wt.branch,
+        merged: wt.merged,
+        base: repo.mainBranch,
+      })
     }
   }
   const mainWorkspaceByRoot = new Map<string, ProjectedWorkspace>()
@@ -211,6 +239,10 @@ export function projectManagedSidebar(input: {
         if (summary !== undefined && !summary.blank) branchBySessionId[sessionId] = wt.branch
       }
     }
+    // 合并状态：只标 linked worktree 行（仓库主行是基准自身，不参与判定）。
+    if (wt.merged !== undefined && wt.base !== undefined) {
+      mergeByWorkspaceId[workspace.workspaceId] = { merged: wt.merged, base: wt.base }
+    }
     // 仓库主行存在时把 worktree 行嵌套为其下一级；否则 fail-open 就地保留。
     const main = mainWorkspaceByRoot.get(wt.repoRoot)
     if (main !== undefined && main.workspaceId !== workspace.workspaceId) {
@@ -262,6 +294,7 @@ export function projectManagedSidebar(input: {
     workspaces: ordered,
     branchBySessionId,
     branchByWorkspaceId,
+    mergeByWorkspaceId,
     nestedWorkspaceIds: nested,
   }
 }

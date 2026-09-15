@@ -205,6 +205,13 @@ function injectStyles(): void {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 已合并到基准分支（仓库主工作树分支）的 worktree：图标与 pill 都换成 success 绿 */
+.dsh-worktree-manager-sidebar-badge.dsh-worktree-manager-merged {
+  --dsh-wt-sidebar-accent: var(--dsw-alias-state-success-primary, #a6e3a1);
+}
+.dsh-worktree-manager-sidebar-icon.dsh-worktree-manager-merged {
+  color: var(--dsw-alias-state-success-primary, #a6e3a1);
+}
 `
   document.head.appendChild(style)
 }
