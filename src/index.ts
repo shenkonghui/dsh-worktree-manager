@@ -9,7 +9,6 @@
  *
  * Routes:
  *   GET  /plugins/dsh-worktree-manager/api/list?repoPath=<path>
- *   GET  /plugins/dsh-worktree-manager/api/repos
  *   GET  /plugins/dsh-worktree-manager/api/topology
  *   GET  /plugins/dsh-worktree-manager/api/changes?path=<dir>
  *   GET  /plugins/dsh-worktree-manager/api/history?path=<dir>&limit=<n>
@@ -18,6 +17,9 @@
  *   POST /plugins/dsh-worktree-manager/api/create   { repoPath, branch, targetPath?, newBranch? }
  *   POST /plugins/dsh-worktree-manager/api/remove   { worktreePath, force? }
  *   POST /plugins/dsh-worktree-manager/api/branches { repoPath }
+ *
+ * `topology` 聚合了仓库发现（原 /api/repos）与各仓库的 worktree 列表，供
+ * 下拉与侧边栏投影一次拉全。POST 写操作校验 Origin 与 Host 同源。
  */
 
 import { execFile } from 'node:child_process'
@@ -41,6 +43,7 @@ interface Context {
     create(path: string, title?: string): Promise<{ id: string; path: string; title: string }>
     list(): Array<{ id: string; path: string; title: string }>
     resolveByPath(path: string): Promise<{ id: string; path: string; title: string } | undefined>
+    delete(id: string): Promise<boolean>
   }
 }
 
@@ -48,6 +51,9 @@ const execFileAsync = promisify(execFile)
 
 /** Maximum stdout capture for git commands (1 MiB). */
 const MAX_GIT_STDOUT = 1 << 20
+
+/** Maximum stdout capture for the diff route (8 MiB): diffs grow with file size. */
+const MAX_DIFF_STDOUT = 8 << 20
 
 /** Route prefix shared with the client half. */
 const API_PREFIX = '/plugins/dsh-worktree-manager/api/'
@@ -104,29 +110,19 @@ interface RepoWorkspace {
   title: string
 }
 
-/** One discovered repository root with its registered dsh workspaces. */
-interface RepoGroup {
-  /** Canonical git repository root (parent of the common `.git`). */
-  root: string
-  /** Basename of {@link root}, for display. */
-  name: string
-  /** dsh workspaces whose path lives inside this repository (any worktree). */
-  workspaces: RepoWorkspace[]
-}
-
-/** Response body for the repos aggregation route. */
-interface ReposResponse {
-  repos: RepoGroup[]
-}
-
 /** Run a git command in the given directory and return trimmed stdout. */
-async function runGit(workdir: string, args: string[]): Promise<string> {
+async function runGit(workdir: string, args: string[], opts: { maxBuffer?: number } = {}): Promise<string> {
   const { stdout } = await execFileAsync('git', args, {
     cwd: workdir,
-    maxBuffer: MAX_GIT_STDOUT,
+    maxBuffer: opts.maxBuffer ?? MAX_GIT_STDOUT,
     encoding: 'utf8',
   })
   return stdout.trim()
+}
+
+/** 去掉尾部斜杠后的末段路径（展示名）。 */
+function basename(p: string): string {
+  return p.replace(/\/+$/, '').split('/').pop() ?? p
 }
 
 /**
@@ -251,7 +247,29 @@ function errorStatus(message: string): number {
   if (message.includes('already exists') || message.includes('already checked out')) {
     return 409
   }
+  if (message.includes('request body too large')) {
+    return 413
+  }
+  if (message.includes('invalid ') || message.includes('missing ')) {
+    return 400
+  }
   return 500
+}
+
+/**
+ * CSRF 防护：浏览器发起的请求必带 Origin 头，非浏览器客户端（curl 等）不带。
+ * Origin 与 Host 不同源时拒绝写操作；同源代理访问不受影响。
+ */
+function sameOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin
+  if (origin === undefined) return true
+  const host = req.headers.host
+  if (host === undefined) return false
+  try {
+    return new URL(origin).host === host
+  } catch {
+    return false
+  }
 }
 
 /** List git worktrees for the repository at repoPath. */
@@ -291,43 +309,42 @@ async function resolveRepoRoot(startPath: string): Promise<string | null> {
  * repository. Workspaces not inside any git repository are omitted. The same
  * workspace path appearing under multiple worktrees is listed once per
  * repository it belongs to (in practice exactly one).
+ *
+ * Per-workspace `git rev-parse` runs run concurrently — the registry can hold
+ * many workspaces and each scan spawns a git subprocess.
  */
-async function handleRepos(ctx: Context): Promise<ReposResponse> {
-  const workspaces = ctx.workspaceRegistry.list()
-  const groups = new Map<string, RepoGroup>()
-
-  for (const ws of workspaces) {
-    const root = await resolveRepoRoot(ws.path)
+async function groupWorkspacesByRepo(
+  workspaces: Array<{ id: string; path: string; title: string }>,
+): Promise<Map<string, RepoWorkspace[]>> {
+  const roots = await Promise.all(workspaces.map(async ws => ({
+    ws,
+    root: await resolveRepoRoot(ws.path),
+  })))
+  const groups = new Map<string, RepoWorkspace[]>()
+  for (const { ws, root } of roots) {
     if (!root) continue
     let group = groups.get(root)
     if (!group) {
-      group = {
-        root,
-        name: root.replace(/\/+$/, '').split('/').pop() ?? root,
-        workspaces: [],
-      }
+      group = []
       groups.set(root, group)
     }
-    group.workspaces.push({ id: ws.id, path: ws.path, title: ws.title })
+    group.push({ id: ws.id, path: ws.path, title: ws.title })
   }
-
-  // Stable order: by repository root path
-  const repos = [...groups.values()].sort((a, b) => a.root.localeCompare(b.root))
-  return { repos }
+  return groups
 }
 
-/** 每个仓库的侧边栏投影拓扑：分支归属与 workspace 归属。 */
+/** 每个仓库的侧边栏投影拓扑：分支归属、workspace 归属与合并状态。 */
 interface RepoTopology {
-  /** 规范化 git 仓库根（与 {@link RepoGroup.root} 语义一致）。 */
+  /** 规范化 git 仓库根（主工作树目录）。 */
   root: string
   /** 展示名（根路径 basename）。 */
   name: string
   /** 主工作树（path === root）当前分支；detached HEAD 时缺省。 */
   mainBranch?: string
-  /** 非主 worktree 列表（含各自分支与合并状态）。 */
-  worktrees: Array<{ path: string; branch?: string; merged?: boolean }>
-  /** 注册在该仓库下的 dsh workspace id（主 + worktree）。 */
-  workspaceIds: string[]
+  /** 非主 worktree 列表（含各自分支、合并状态与 locked/prunable 徽标）。 */
+  worktrees: Array<{ path: string; branch?: string; merged?: boolean; locked?: boolean; prunable?: boolean }>
+  /** 注册在该仓库下的 dsh workspace（主 + worktree），id/path/title 齐全。 */
+  workspaces: RepoWorkspace[]
 }
 
 /** GET /api/topology 的响应体。 */
@@ -372,7 +389,8 @@ export async function headMergedInto(
 /**
  * 把仓库的 linked worktree 转成拓扑行，并为每行判定 `merged`。基准分支或分支
  * 集合不可用时省略该字段（保持「未知」，客户端维持原有配色）——绝不因为判定
- * 不出来就把 worktree 标成未合并。导出供自检脚本使用。
+ * 不出来就把 worktree 标成未合并。行上还带 locked/prunable 供下拉徽标展示。
+ * 导出供自检脚本使用。
  */
 export async function worktreeRows(
   root: string,
@@ -391,6 +409,8 @@ export async function worktreeRows(
     return {
       path: entry.path,
       ...(branch === undefined ? {} : { branch }),
+      ...(entry.wt.locked ? { locked: true } : {}),
+      ...(entry.wt.prunable ? { prunable: true } : {}),
       ...(merged === undefined ? {} : { merged }),
     }
   }))
@@ -399,38 +419,22 @@ export async function worktreeRows(
 /**
  * Build the sidebar projection topology: for every registered dsh workspace
  * grouped under its git repository root, expose the main branch, the linked
- * worktree paths with their branches, and the workspace ids living under the
+ * worktree paths with their branches, and the workspaces living under the
  * repository. The client projection uses this to aggregate worktree sessions
  * under the repository's main workspace row and to label branch names.
  *
  * 每个 worktree 还带一个 `merged` 标记：其分支（或 detached HEAD）是否已完全
  * 合并到基准分支。基准取仓库主工作树当前检出的分支——即「是否已合回主干」的
  * 语义，主干自身不参与判定。基准不存在（主工作树 detached HEAD）时省略该字段。
+ * 仓库之间、workspace 归属扫描均并发执行。
  */
 async function handleTopology(ctx: Context): Promise<TopologyResponse> {
-  const workspaces = ctx.workspaceRegistry.list()
-  const groups = new Map<string, { root: string; name: string; workspaceIds: string[] }>()
+  const groups = await groupWorkspacesByRepo(ctx.workspaceRegistry.list())
 
-  for (const ws of workspaces) {
-    const root = await resolveRepoRoot(ws.path)
-    if (!root) continue
-    let group = groups.get(root)
-    if (!group) {
-      group = {
-        root,
-        name: root.replace(/\/+$/, '').split('/').pop() ?? root,
-        workspaceIds: [],
-      }
-      groups.set(root, group)
-    }
-    group.workspaceIds.push(ws.id)
-  }
-
-  const repos: RepoTopology[] = []
-  for (const group of groups.values()) {
+  const repos: RepoTopology[] = await Promise.all([...groups.entries()].map(async ([root, workspaces]) => {
     let worktrees: WorktreeInfo[] = []
     try {
-      const porcelain = await runGit(group.root, ['worktree', 'list', '--porcelain'])
+      const porcelain = await runGit(root, ['worktree', 'list', '--porcelain'])
       worktrees = parseWorktreeList(porcelain)
     } catch {
       // Prunable / broken repository: report the workspace grouping with no
@@ -441,21 +445,21 @@ async function handleTopology(ctx: Context): Promise<TopologyResponse> {
       wt,
       path: await realpath(wt.path).catch(() => wt.path),
     })))
-    const main = canonical.find(entry => entry.path === group.root)
+    const main = canonical.find(entry => entry.path === root)
     const mainBranch = main?.wt.branch
     // 一次 `git branch --merged` 覆盖整仓的分支级判定。
     const mergedBranches = mainBranch === undefined
       ? undefined
-      : await mergedBranchesInto(group.root, mainBranch)
+      : await mergedBranchesInto(root, mainBranch)
     const linked = canonical.filter(entry => entry !== main && !entry.wt.bare)
-    repos.push({
-      root: group.root,
-      name: group.name,
+    return {
+      root,
+      name: basename(root),
       ...(mainBranch === undefined ? {} : { mainBranch }),
-      worktrees: await worktreeRows(group.root, mainBranch, mergedBranches, linked),
-      workspaceIds: group.workspaceIds,
-    })
-  }
+      worktrees: await worktreeRows(root, mainBranch, mergedBranches, linked),
+      workspaces,
+    }
+  }))
 
   repos.sort((a, b) => a.root.localeCompare(b.root))
   return { repos }
@@ -567,13 +571,13 @@ async function handleChanges(query: Record<string, string>): Promise<ChangesResp
   // section below; keeping them would double-count.
   const files = entries.filter(entry => !entry.gitlink)
 
-  let subStatus: string[] = []
+  let subStatus = ''
   try {
-    subStatus = (await runGit(root, ['submodule', 'status'])).split('\n').filter(line => line !== '')
+    subStatus = await runGit(root, ['submodule', 'status'])
   } catch {
     // no submodules (or git too old) — empty list
   }
-  const submodules = (await Promise.all(parseSubmoduleStatus(subStatus.join('\n')).map(async sub => {
+  const submodules = (await Promise.all(parseSubmoduleStatus(subStatus).map(async sub => {
     let files: ChangeFile[] = []
     if (!sub.uninitialized) {
       try {
@@ -584,7 +588,7 @@ async function handleChanges(query: Record<string, string>): Promise<ChangesResp
         // submodule gitdir missing/prunable — report the marker without files
       }
     }
-    return { ...sub, name: sub.path.replace(/\/+$/, '').split('/').pop() ?? sub.path, files }
+    return { ...sub, name: basename(sub.path), files }
   }))).filter(sub => !sub.uninitialized && (sub.newCommits || sub.files.length > 0))
 
   return { root, branch: await currentBranch(root), files, submodules }
@@ -712,7 +716,7 @@ async function handleCommitDetail(query: Record<string, string>): Promise<Commit
     }
     return {
       path: row.path,
-      name: row.path.replace(/\/+$/, '').split('/').pop() ?? row.path,
+      name: basename(row.path),
       commits,
     }
   }))
@@ -737,7 +741,9 @@ function safeRelPath(value: string): string {
  * Unified diff of one file. With `hash`, the commit's diff for that file;
  * otherwise the working tree vs HEAD (staged + unstaged). Untracked files have
  * no HEAD diff — fall back to a /dev/null pseudo-diff (`git diff --no-index`
- * exits 1 when differences exist, with the diff on stdout).
+ * exits 1 when differences exist, with the diff on stdout). Both calls use a
+ * larger maxBuffer; when it is still exceeded, the captured partial output is
+ * returned instead of failing the route.
  */
 async function handleDiff(query: Record<string, string>): Promise<DiffResponse> {
   if (!query.path) throw new Error('missing path query parameter')
@@ -745,23 +751,25 @@ async function handleDiff(query: Record<string, string>): Promise<DiffResponse> 
   const root = await resolveWorktree(query.path)
   const workdir = query.sub ? resolve(root, safeRelPath(query.sub)) : root
 
-  if (query.hash !== undefined) {
-    if (!/^[0-9a-f]{4,40}$/i.test(query.hash)) throw new Error('invalid hash parameter')
-    return { diff: await runGit(workdir, ['show', '--format=', query.hash, '--', file]) }
+  /** Run a diff command, degrading to its partial stdout on failure. */
+  const tryDiff = async (args: string[]): Promise<string> => {
+    try {
+      return await runGit(workdir, args, { maxBuffer: MAX_DIFF_STDOUT })
+    } catch (err) {
+      // Unborn HEAD / `--no-index` exit 1 / maxBuffer exceeded: the diff (or
+      // its truncated prefix) is in stdout.
+      return (err as { stdout?: string }).stdout ?? ''
+    }
   }
 
-  let diff = ''
-  try {
-    diff = await runGit(workdir, ['diff', 'HEAD', '--', file])
-  } catch {
-    // unborn HEAD — fall through to the untracked pseudo-diff
+  if (query.hash !== undefined) {
+    if (!/^[0-9a-f]{4,40}$/i.test(query.hash)) throw new Error('invalid hash parameter')
+    return { diff: await tryDiff(['show', '--format=', query.hash, '--', file]) }
   }
+
+  let diff = await tryDiff(['diff', 'HEAD', '--', file])
   if (diff === '') {
-    try {
-      diff = await runGit(workdir, ['diff', '--no-index', '--', '/dev/null', file])
-    } catch (err) {
-      diff = (err as { stdout?: string }).stdout ?? ''
-    }
+    diff = await tryDiff(['diff', '--no-index', '--', '/dev/null', file])
   }
   return { diff }
 }
@@ -774,36 +782,29 @@ async function handleCreate(
   if (!body.repoPath) throw new Error('missing repoPath')
   if (!body.branch) throw new Error('missing branch')
   const canonical = await resolveGitRoot(body.repoPath)
+  // Authoritative refname check; --branch mode also rejects option-like
+  // names (leading '-') that git would otherwise parse as flags.
+  try {
+    await runGit(canonical, ['check-ref-format', '--branch', body.branch])
+  } catch {
+    throw new Error(`invalid branch name: ${body.branch}`)
+  }
 
   // Default target path: <repo>-worktrees/<branch>
-  const targetPath = body.targetPath ?? resolve(canonical, '..', `${canonical.split('/').pop()}-worktrees`, body.branch)
+  const targetPath = body.targetPath ?? resolve(canonical, '..', `${basename(canonical)}-worktrees`, body.branch)
 
-  // Build git worktree add arguments
-  const args = ['worktree', 'add']
-  if (body.newBranch) {
-    args.push('-b', body.branch)
-  } else {
-    args.push('--track' /* no-op for local branches, harmless */)
-    args.push(body.branch)
-  }
-  // If newBranch is false, we pass the branch name as the last positional arg
-  // (git worktree add <path> <branch>). If newBranch is true, -b <branch> already
-  // names the new branch, so the path is the only remaining positional.
-  if (body.newBranch) {
-    args.push(targetPath)
-  } else {
-    // Remove the --track flag we added above; it's not valid for worktree add
-    // without a remote tracking branch. Use plain positional form.
-    args.splice(2) // remove everything after 'add'
-    args.push(targetPath, body.branch)
-  }
-
+  const args = body.newBranch
+    ? ['worktree', 'add', '-b', body.branch, targetPath]
+    : ['worktree', 'add', targetPath, body.branch]
   await runGit(canonical, args)
 
-  // Read back the created worktree info
+  // Read back the created worktree info. Git reports realpath-canonicalized
+  // paths, so compare against the realpath of the target too (symlinked
+  // parents such as /tmp on macOS would otherwise miss the lookup).
   const porcelain = await runGit(canonical, ['worktree', 'list', '--porcelain'])
-  const worktrees = parseWorktreeList(porcelain)
-  const created = worktrees.find(w => w.path === targetPath || w.path === resolve(targetPath))
+  const targetReal = await realpath(targetPath).catch(() => resolve(targetPath))
+  const created = parseWorktreeList(porcelain)
+    .find(w => w.path === targetPath || w.path === targetReal)
   if (!created) {
     throw new Error('worktree was created but could not be found in worktree list')
   }
@@ -813,14 +814,20 @@ async function handleCreate(
   return { worktree: created, workspaceId: workspace.id as string }
 }
 
-/** Remove a git worktree. */
-async function handleRemove(body: RemoveRequest): Promise<{ removed: true }> {
+/** Remove a git worktree and unregister its dsh workspace. */
+async function handleRemove(ctx: Context, body: RemoveRequest): Promise<{ removed: true }> {
   if (!body.worktreePath) throw new Error('missing worktreePath')
   const canonical = await realpath(resolve(body.worktreePath))
-  // git worktree remove must be run from any worktree of the same repo
+  // Delete from the main worktree (first porcelain row): running with cwd
+  // inside the removed directory can fail on platforms that lock a busy cwd.
+  const porcelain = await runGit(canonical, ['worktree', 'list', '--porcelain'])
+  const mainPath = parseWorktreeList(porcelain)[0]?.path ?? canonical
   const args = ['worktree', 'remove', canonical]
   if (body.force) args.push('--force')
-  await runGit(canonical, args)
+  await runGit(mainPath, args)
+  // 反注册挂在该 worktree 上的 workspace；找不到（未注册过）时静默跳过。
+  const ws = await ctx.workspaceRegistry.resolveByPath(canonical).catch(() => undefined)
+  if (ws !== undefined) await ctx.workspaceRegistry.delete(ws.id).catch(() => false)
   return { removed: true }
 }
 
@@ -850,7 +857,7 @@ function createRouteHandler(ctx: Context) {
         return
       }
       const action = url.slice(API_PREFIX.length).split('?')[0]
-      if (action !== 'list' && action !== 'repos' && action !== 'topology' && action !== 'changes'
+      if (action !== 'list' && action !== 'topology' && action !== 'changes'
         && action !== 'history' && action !== 'commit' && action !== 'diff') {
         sendJson(res, 404, { error: `unknown GET action: ${action}` })
         return
@@ -872,11 +879,8 @@ function createRouteHandler(ctx: Context) {
         } else if (action === 'commit') {
           const result = await handleCommitDetail(parseQuery(url))
           sendJson(res, 200, result)
-        } else if (action === 'diff') {
-          const result = await handleDiff(parseQuery(url))
-          sendJson(res, 200, result)
         } else {
-          const result = await handleRepos(ctx)
+          const result = await handleDiff(parseQuery(url))
           sendJson(res, 200, result)
         }
       } catch (err) {
@@ -894,6 +898,10 @@ function createRouteHandler(ctx: Context) {
       }
       const action = url.slice(API_PREFIX.length).split('?')[0]
       try {
+        if (!sameOrigin(req)) {
+          sendJson(res, 403, { error: 'cross-origin request rejected' })
+          return
+        }
         const bodyText = await readBody(req)
         const body = bodyText.length > 0 ? JSON.parse(bodyText) : {}
         switch (action) {
@@ -903,7 +911,7 @@ function createRouteHandler(ctx: Context) {
             break
           }
           case 'remove': {
-            const result = await handleRemove(body as RemoveRequest)
+            const result = await handleRemove(ctx, body as RemoveRequest)
             sendJson(res, 200, result)
             break
           }

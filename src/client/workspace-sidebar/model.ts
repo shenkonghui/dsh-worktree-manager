@@ -17,6 +17,8 @@
  * - 归属无法证明时 fail-open：worktree 行就地保留为顶层行，绝不隐藏会话。
  */
 
+import type { RepoTopology, TopologyResponse } from '../api.js'
+
 /** 官方 useWorkspaces 快照中的 workspace 行。 */
 export interface SidebarWorkspace {
   workspaceId: string
@@ -45,19 +47,10 @@ export interface SidebarSessionListState {
 }
 
 /** GET /api/topology 中每个仓库的拓扑行（与宿主 RepoTopology 对应）。 */
-export interface SidebarTopologyRepo {
-  root: string
-  name: string
-  mainBranch?: string
-  /** 非主 worktree 列表；`merged` 缺省表示宿主未能判定（保持原有配色）。 */
-  worktrees: ReadonlyArray<{ path: string; branch?: string; merged?: boolean }>
-  workspaceIds: readonly string[]
-}
+export type SidebarTopologyRepo = RepoTopology
 
 /** GET /api/topology 的响应体。 */
-export interface SidebarTopology {
-  repos: readonly SidebarTopologyRepo[]
-}
+export type SidebarTopology = TopologyResponse
 
 /** worktree 行的合并状态：徽标染绿 + 提示文案。 */
 export interface WorktreeMergeStatus {

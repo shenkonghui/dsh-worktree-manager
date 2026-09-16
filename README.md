@@ -29,23 +29,22 @@ A Cordis plugin that injects `ctx.webServer`, `ctx.shell`, and `ctx.workspaceReg
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/list?repoPath=<path>` | List git worktrees for a repository |
-| GET | `/api/repos` | Scan all dsh workspaces and group them by git repository root |
-| GET | `/api/topology` | Per-repo branch/workspace topology for the sidebar projection |
+| GET | `/api/topology` | Per-repo branch/workspace topology (repo discovery + worktree lists + merge status in one scan) |
 | GET | `/api/changes?path=<dir>` | Working-tree changes of the containing repo, recursing into submodules |
 | GET | `/api/history?path=<dir>&limit=<n>` | Commit history of the containing worktree, newest first |
 | GET | `/api/commit?path=<dir>&hash=<sha>` | One commit's changed files; submodule pointer moves list the submodule commits in between |
 | GET | `/api/diff?path=<dir>&file=<rel>[&sub=<rel>][&hash=<sha>]` | Unified diff of one file (working tree vs HEAD, or one commit) |
 | POST | `/api/create` | Create a new worktree and register it as a workspace |
-| POST | `/api/remove` | Remove a git worktree |
+| POST | `/api/remove` | Remove a git worktree and unregister its dsh workspace |
 | POST | `/api/branches` | List branches in a repository |
 
-The host half uses `node:child_process` to run `git worktree` commands and `ctx.workspaceRegistry.create()` to register worktrees as dsh workspaces.
+The host half uses `node:child_process` to run `git worktree` commands and `ctx.workspaceRegistry.create()` to register worktrees as dsh workspaces. POST requests are rejected when the `Origin` header doesn't match the request `Host` (CSRF guard); non-browser clients that omit `Origin` are unaffected.
 
 ### Client half (`src/client/index.ts`)
 
 A browser module loaded at boot (`immediately: true`). It uses a `MutationObserver` to detect when the workspace picker appears in the SPA, then injects a "Git Worktree" button. Clicking the button opens a dropdown that:
 
-- Calls `GET /api/repos` to discover all git repositories among the registered dsh workspaces
+- Calls `GET /api/topology` to discover all git repositories among the registered dsh workspaces
 - Concurrently loads worktrees for every discovered repository via `GET /api/list`
 - Renders worktrees grouped by repository, each section collapsible; the repository containing the current workspace expands by default
 - Provides a search box that filters worktrees across all repositories by name, branch, or path
@@ -138,17 +137,20 @@ Returns:
 }
 ```
 
-### `GET /plugins/dsh-worktree-manager/api/repos`
+### `GET /plugins/dsh-worktree-manager/api/topology`
 
-No parameters. Scans every registered dsh workspace, resolves its git repository root via `git rev-parse --git-common-dir` (so linked worktrees group under their main worktree), and returns one entry per distinct root.
+No parameters. Scans every registered dsh workspace, resolves its git repository root via `git rev-parse --git-common-dir` (so linked worktrees group under their main worktree), and returns one entry per distinct root — repo discovery, per-repo worktree lists and merge status all in one response.
 
-Returns:
 ```json
 {
   "repos": [
     {
       "root": "/path/to/repo",
       "name": "repo",
+      "mainBranch": "main",
+      "worktrees": [
+        { "path": "/path/to/repo-worktrees/feature", "branch": "feature", "merged": true, "locked": true }
+      ],
       "workspaces": [
         { "id": "ws-uuid", "path": "/path/to/repo", "title": "repo" },
         { "id": "ws-uuid-2", "path": "/path/to/repo-worktrees/feature", "title": "feature" }
@@ -157,6 +159,8 @@ Returns:
   ]
 }
 ```
+
+`worktrees` lists only linked worktrees (the main worktree is `root` itself); `merged` is absent when the host could not decide (e.g. the main worktree is on detached HEAD). `locked`/`prunable` are present only when set, for dropdown badges.
 
 ### `GET /plugins/dsh-worktree-manager/api/changes`
 
@@ -229,6 +233,8 @@ Body:
   "force": false
 }
 ```
+
+Deletes the worktree from its main worktree and unregisters the dsh workspace registered for it (if any).
 
 ### `POST /plugins/dsh-worktree-manager/api/branches`
 

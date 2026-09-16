@@ -14,6 +14,7 @@
  */
 import { useEffect, useState, type ComponentType, type CSSProperties } from 'react'
 import { apiGet, WORKTREE_REFRESH_EVENT } from './api.js'
+import { UI, format } from './locales.js'
 import { useSessionCwd, type SessionsListService } from './session-branch-badge.js'
 
 // ---- API types (matching the host half) ----
@@ -321,58 +322,14 @@ const commitLine: CSSProperties = {
 
 // ---- Component ----
 
-/** 视图文案：与标签 label 同一语言判定（现有 DOM 注入同款约定，不引入 locale 服务）。 */
-const STR = navigator.language.startsWith('zh')
-  ? {
-      tab: '变更',
-      refresh: '刷新',
-      loading: '正在读取 git 历史…',
-      notRepo: '当前会话目录不是 git 仓库',
-      error: '加载失败',
-      worktree: '未提交的变更',
-      newCommits: '新提交',
-      nChanges: (n: number): string => `${n} 个变更`,
-      noChanges: '无变更',
-      clean: '工作区无变更',
-      subNoFileChange: '工作区文件无改动（HEAD 与索引不一致）',
-      pointerCommits: '子模块提交',
-      subUnavailable: '子模块仓库不可用',
-      noDiff: '无内容差异',
-      justNow: '刚刚',
-      minutesAgo: '分钟前',
-      hoursAgo: '小时前',
-      daysAgo: '天前',
-      summary: (commits: number): string => `${commits} 个提交`,
-    }
-  : {
-      tab: 'Changes',
-      refresh: 'Refresh',
-      loading: 'Reading git history…',
-      notRepo: 'The session directory is not a git repository',
-      error: 'Failed to load',
-      worktree: 'Uncommitted changes',
-      newCommits: 'new commits',
-      nChanges: (n: number): string => `${n} changes`,
-      noChanges: 'No changes',
-      clean: 'No changes',
-      subNoFileChange: 'No working-tree changes (HEAD differs from index)',
-      pointerCommits: 'Submodule commits',
-      subUnavailable: 'Submodule repository unavailable',
-      justNow: 'just now',
-      minutesAgo: 'min ago',
-      hoursAgo: 'h ago',
-      daysAgo: 'd ago',
-      summary: (commits: number): string => `${commits} commits`,
-    }
-
 /** 相对时间：分钟/小时/天前，超过 30 天显示日期。 */
 function relTime(ms: number): string {
   const diff = Date.now() - ms
   const minute = 60_000
-  if (diff < minute) return STR.justNow
-  if (diff < 60 * minute) return `${Math.floor(diff / minute)} ${STR.minutesAgo}`
-  if (diff < 24 * 60 * minute) return `${Math.floor(diff / 3_600_000)} ${STR.hoursAgo}`
-  if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)} ${STR.daysAgo}`
+  if (diff < minute) return UI.changes.justNow
+  if (diff < 60 * minute) return `${Math.floor(diff / minute)} ${UI.changes.minutesAgo}`
+  if (diff < 24 * 60 * minute) return `${Math.floor(diff / 3_600_000)} ${UI.changes.hoursAgo}`
+  if (diff < 30 * 86_400_000) return `${Math.floor(diff / 86_400_000)} ${UI.changes.daysAgo}`
   return new Date(ms).toLocaleDateString()
 }
 
@@ -431,7 +388,7 @@ function SubmoduleHead({ sub, badge }: { sub: SubmoduleChanges; badge?: string }
   return (
     <div style={subHeader} title={sub.path}>
       <span>{sub.name}</span>
-      {sub.newCommits && <span style={subBadge}>{STR.newCommits}</span>}
+      {sub.newCommits && <span style={subBadge}>{UI.changes.newCommits}</span>}
       {badge !== undefined && <span style={subBadge}>{badge}</span>}
     </div>
   )
@@ -454,11 +411,11 @@ function WorktreeDetail(props: {
           <div style={subBody}>
             {sub.files.length > 0
               ? <FileRows files={sub.files} sub={sub.path} selected={props.selected} onSelect={props.onSelect} />
-              : <p style={note}>{sub.newCommits ? STR.subNoFileChange : STR.noChanges}</p>}
+              : <p style={note}>{sub.newCommits ? UI.changes.subNoFileChange : UI.changes.noChanges}</p>}
           </div>
         </div>
       ))}
-      {fileCount === 0 && subCount === 0 && <p style={note}>{STR.clean}</p>}
+      {fileCount === 0 && subCount === 0 && <p style={note}>{UI.changes.clean}</p>}
     </>
   )
 }
@@ -479,7 +436,7 @@ function CommitDetail(props: {
         <div key={sub.path}>
           <div style={subHeader} title={sub.path}>
             <span>{sub.name}</span>
-            <span style={subBadge}>{STR.pointerCommits}</span>
+            <span style={subBadge}>{UI.changes.pointerCommits}</span>
           </div>
           <div style={subBody}>
             {sub.commits.length > 0
@@ -490,11 +447,11 @@ function CommitDetail(props: {
                   ))}
                 </ul>
               )
-              : <p style={note}>{STR.subUnavailable}</p>}
+              : <p style={note}>{UI.changes.subUnavailable}</p>}
           </div>
         </div>
       ))}
-      {props.detail.files.length === 0 && props.detail.submodules.length === 0 && <p style={note}>{STR.noChanges}</p>}
+      {props.detail.files.length === 0 && props.detail.submodules.length === 0 && <p style={note}>{UI.changes.noChanges}</p>}
     </>
   )
 }
@@ -605,14 +562,14 @@ export function ChangesView(props: { sessionId?: string }): JSX.Element | null {
       <div style={toolbar}>
         <span title={history.phase === 'ready' ? history.data.root : cwd}>
           {history.phase === 'ready' && history.data.branch !== undefined ? `${history.data.branch} · ` : ''}
-          {history.phase === 'ready' ? STR.summary(commits.length) : ''}
+          {history.phase === 'ready' ? format(UI.changes.summary, { n: commits.length }) : ''}
         </span>
-        <button type="button" style={refreshBtn} onClick={refresh}>{STR.refresh}</button>
+        <button type="button" style={refreshBtn} onClick={refresh}>{UI.changes.refresh}</button>
       </div>
-      {history.phase === 'loading' && <p style={note}>{STR.loading}</p>}
-      {notRepo && <p style={note}>{STR.notRepo}</p>}
+      {history.phase === 'loading' && <p style={note}>{UI.changes.loading}</p>}
+      {notRepo && <p style={note}>{UI.changes.notRepo}</p>}
       {!notRepo && history.phase === 'error' && (
-        <p style={errorNote} role="alert">{STR.error}：{history.message}</p>
+        <p style={errorNote} role="alert">{UI.changes.error}：{history.message}</p>
       )}
       {history.phase === 'ready' && (
         <div style={panes}>
@@ -621,16 +578,16 @@ export function ChangesView(props: { sessionId?: string }): JSX.Element | null {
               style={entryRowStyle(selected?.kind === 'worktree')}
               onClick={() => { toggle({ kind: 'worktree' }) }}
             >
-              <div style={entryTitle}>{STR.worktree}</div>
+              <div style={entryTitle}>{UI.changes.worktree}</div>
               <div style={entryMeta}>
-                <span>{worktreeData !== undefined ? STR.nChanges(worktreeCount) : ''}</span>
+                <span>{worktreeData !== undefined ? format(UI.changes.nChanges, { n: worktreeCount }) : ''}</span>
               </div>
             </li>
             {selected?.kind === 'worktree' && (
               <li>
                 <div style={detailBox}>
-                  {worktree.phase === 'loading' && <p style={note}>{STR.loading}</p>}
-                  {worktree.phase === 'error' && <p style={errorNote}>{STR.error}：{worktree.message}</p>}
+                  {worktree.phase === 'loading' && <p style={note}>{UI.changes.loading}</p>}
+                  {worktree.phase === 'error' && <p style={errorNote}>{UI.changes.error}：{worktree.message}</p>}
                   {worktree.phase === 'ready' && (
                     <WorktreeDetail data={worktree.data} selected={selectedFile} onSelect={setSelectedFile} />
                   )}
@@ -652,8 +609,8 @@ export function ChangesView(props: { sessionId?: string }): JSX.Element | null {
                 </div>
                 {selected?.kind === 'commit' && selected.hash === commit.hash && (
                   <div style={detailBox}>
-                    {commitDetail.phase === 'loading' && <p style={note}>{STR.loading}</p>}
-                    {commitDetail.phase === 'error' && <p style={errorNote}>{STR.error}：{commitDetail.message}</p>}
+                    {commitDetail.phase === 'loading' && <p style={note}>{UI.changes.loading}</p>}
+                    {commitDetail.phase === 'error' && <p style={errorNote}>{UI.changes.error}：{commitDetail.message}</p>}
                     {commitDetail.phase === 'ready' && (
                       <CommitDetail detail={commitDetail.data} hash={commit.hash} selected={selectedFile} onSelect={setSelectedFile} />
                     )}
@@ -675,8 +632,8 @@ export function ChangesView(props: { sessionId?: string }): JSX.Element | null {
                   ✕
                 </button>
               </div>
-              {fileDiff.phase === 'loading' && <p style={note}>{STR.loading}</p>}
-              {fileDiff.phase === 'error' && <p style={errorNote}>{STR.error}：{fileDiff.message}</p>}
+              {fileDiff.phase === 'loading' && <p style={note}>{UI.changes.loading}</p>}
+              {fileDiff.phase === 'error' && <p style={errorNote}>{UI.changes.error}：{fileDiff.message}</p>}
               {fileDiff.phase === 'ready' && (
                 fileDiff.data.diff !== ''
                   ? (
@@ -686,7 +643,7 @@ export function ChangesView(props: { sessionId?: string }): JSX.Element | null {
                       ))}
                     </pre>
                   )
-                  : <p style={note}>{STR.noChanges}</p>
+                  : <p style={note}>{UI.changes.noChanges}</p>
               )}
             </div>
           )}
@@ -715,6 +672,6 @@ export function registerChangesView(ctx: ViewSlotContext): void {
     name: 'conversation.view',
     id: 'worktree-changes',
     order: 20,
-    label: () => STR.tab,
+    label: () => UI.changes.tab,
   }, ChangesView))
 }

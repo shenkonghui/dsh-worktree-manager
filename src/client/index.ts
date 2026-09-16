@@ -25,7 +25,19 @@ import { inject as officialWorkspaceInject } from 'virtual:dsh-official-workspac
 import { registerManagedWorkspaceSidebar } from './workspace-sidebar/index.js'
 import { registerSessionBranchBadge } from './session-branch-badge.js'
 import { registerChangesView } from './changes-view.js'
-import { apiGet, apiPost, WORKTREE_REFRESH_EVENT, isGroupingEnabled, setGroupingEnabled } from './api.js'
+import {
+  apiGet,
+  apiPost,
+  basename,
+  WORKTREE_REFRESH_EVENT,
+  isGroupingEnabled,
+  setGroupingEnabled,
+  type CreateResponse,
+  type RepoTopology,
+  type RemoveResponse,
+  type TopologyResponse,
+} from './api.js'
+import { UI, format } from './locales.js'
 
 // ---- Minimal ClientContext type (no dsh build-time dependency) ----
 // The real ClientContext is merged at runtime by the dsh client runtime; this
@@ -36,45 +48,6 @@ import { apiGet, apiPost, WORKTREE_REFRESH_EVENT, isGroupingEnabled, setGrouping
  * list); the DOM-injection surface uses none of them directly.
  */
 export const inject = [...officialWorkspaceInject as string[]] as const
-
-// ---- Types matching the host-side responses ----
-
-interface WorktreeInfo {
-  path: string
-  head: string
-  branch?: string
-  bare: boolean
-  locked: boolean
-  prunable: boolean
-}
-
-interface ListResponse {
-  worktrees: WorktreeInfo[]
-}
-
-interface CreateResponse {
-  worktree: WorktreeInfo
-  workspaceId: string
-}
-
-interface RepoWorkspace {
-  id: string
-  path: string
-  title: string
-}
-
-interface RepoGroup {
-  root: string
-  name: string
-  workspaces: RepoWorkspace[]
-}
-
-interface ReposResponse {
-  repos: RepoGroup[]
-}
-
-// ---- API helpers ----
-// apiGet/apiPost live in ./api.js and are shared with the sidebar projection.
 
 // ---- DOM helpers ----
 
@@ -96,11 +69,6 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node
 }
 
-/** Extract the final path component (trailing slashes trimmed). */
-function basename(p: string): string {
-  const parts = p.replace(/\/+$/, '').split('/')
-  return parts[parts.length - 1] || p
-}
 // ---- Styles ----
 
 const STYLE_ID = 'dsh-worktree-manager-style'
@@ -147,6 +115,15 @@ function injectStyles(): void {
   font-size: 10px; padding: 1px 5px; border-radius: 3px;
   background: var(--dsh-badge, rgba(0,0,0,0.1)); flex: none;
 }
+.dsh-wt-dropdown-item-remove {
+  flex: none; width: 22px; height: 22px; padding: 0;
+  border: none; border-radius: 4px; cursor: pointer;
+  background: transparent; color: var(--dsh-fg, inherit); opacity: 0;
+  font-size: 14px; line-height: 1;
+}
+.dsh-wt-dropdown-item:hover .dsh-wt-dropdown-item-remove { opacity: 0.6; }
+.dsh-wt-dropdown-item-remove:hover { opacity: 1 !important; background: var(--dsh-hover, rgba(0,0,0,0.08)); }
+.dsh-wt-dropdown-item-remove:disabled { cursor: wait; opacity: 0.4 !important; }
 .dsh-wt-dropdown-loading { padding: 16px; text-align: center; opacity: 0.6; }
 .dsh-wt-dropdown-error { padding: 12px; color: #f38ba8; font-size: 12px; }
 .dsh-wt-dropdown-create {
@@ -361,6 +338,16 @@ function onDocClick(e: MouseEvent): void {
   }
 }
 
+/** 下拉里一行的展示数据：主工作树或 linked worktree。 */
+interface DropdownRow {
+  path: string
+  branch?: string
+  /** linked 行可移除；主工作树行不可。 */
+  main: boolean
+  locked?: boolean
+  prunable?: boolean
+}
+
 /** Show the worktree dropdown anchored above the trigger button. */
 async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   closeDropdown()
@@ -379,28 +366,13 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   // Click-away listener
   setTimeout(() => document.addEventListener('click', onDocClick), 0)
 
-  // Loading state
-  dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '正在扫描 git 仓库…' }))
-
-  // 1. Fetch all discovered repositories (grouped by git common root)
-  let repos: RepoGroup[]
-  try {
-    const reposRes = await apiGet('repos', {}) as ReposResponse
-    repos = reposRes.repos
-  } catch (err) {
+  /** Replace dropdown content with an inline error line. */
+  const showError = (msg: string): void => {
     dropdown.innerHTML = ''
-    const msg = err instanceof Error ? err.message : String(err)
     dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: msg }))
-    return
   }
 
-  if (repos.length === 0) {
-    dropdown.innerHTML = ''
-    dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: '当前所有工作区均不是 git 仓库' }))
-    return
-  }
-
-  // 2. Detect the workspace selected on the left (the workspace chip shows
+  // 1. Detect the workspace selected on the left (the workspace chip shows
   // its title); only that workspace's repo contributes worktrees. The chip
   // carries a stable aria-label (zh/en) and its visible label span holds the
   // workspace title.
@@ -427,54 +399,48 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
       }
     } catch { /* 快照不可用时按未选中处理 */ }
   }
+
+  // 2. One topology fetch covers repository discovery and per-repo worktree
+  // lists (the old repos + N×list round-trips collapsed into it).
+  let topology: TopologyResponse
+  try {
+    topology = await apiGet('topology') as TopologyResponse
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    showError(msg)
+    return
+  }
+  if (topology.repos.length === 0) {
+    showError(UI.dropdown.noRepos)
+    return
+  }
+
+  const containsRepo = (path: string, repo: RepoTopology): boolean =>
+    path === repo.root || path.startsWith(repo.root + '/')
   const currentRepoRoot = currentWs !== null
-    ? repos.find(r => currentWs.path === r.root || currentWs.path.startsWith(r.root + '/'))?.root ?? null
+    ? topology.repos.find(r => containsRepo(currentWs.path, r))?.root ?? null
     : null
 
   // Scope to the selected workspace's repo; fall back to all repos only when
   // no workspace selection could be detected at all.
   const targetRepos = currentRepoRoot !== null
-    ? repos.filter(r => r.root === currentRepoRoot)
-    : currentWs === null ? repos : []
+    ? topology.repos.filter(r => r.root === currentRepoRoot)
+    : currentWs === null ? topology.repos : []
 
   if (targetRepos.length === 0) {
-    dropdown.innerHTML = ''
-    dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: '当前工作区不属于任何 git 仓库' }))
+    showError(UI.dropdown.notInRepo)
     return
   }
 
-  // 3. Load worktrees for the target repo(s)
+  // 3. Render grouped list with search filter; removals re-render in place.
   dropdown.innerHTML = ''
-  dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '正在加载 worktree 列表…' }))
-
-  interface RepoWithWorktrees {
-    repo: RepoGroup
-    worktrees: WorktreeInfo[]
-    error?: string
-  }
-  const loaded: RepoWithWorktrees[] = await Promise.all(
-    targetRepos.map(async r => {
-      try {
-        const listRes = await apiGet('list', { repoPath: r.root }) as ListResponse
-        return { repo: r, worktrees: listRes.worktrees }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        return { repo: r, worktrees: [], error: msg }
-      }
-    }),
-  )
-
-  // 4. Render grouped list with search filter
-  dropdown.innerHTML = ''
-
-  const totalWorktrees = loaded.reduce((n, g) => n + g.worktrees.length, 0)
-  const headerText = `${loaded.length} 个仓库 · ${totalWorktrees} 个 worktree`
-  dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-header', text: headerText }))
+  const header = el('div', { class: 'dsh-wt-dropdown-header' })
+  dropdown.appendChild(header)
 
   // Search input
   const searchBox = el('input', {
     class: 'dsh-wt-dropdown-input',
-    placeholder: '筛选 worktree (按名称/分支/路径)…',
+    placeholder: UI.dropdown.filterPlaceholder,
     style: 'width:100%;box-sizing:border-box;margin:0;border:0;border-bottom:1px solid var(--dsh-border, rgba(0,0,0,0.06));border-radius:0;padding:8px 12px;',
   })
   dropdown.appendChild(searchBox)
@@ -483,6 +449,18 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
   const listContainer = el('div')
   dropdown.appendChild(listContainer)
 
+  /** Flat rows per repo: the main worktree first, then linked worktrees. */
+  const rowsOf = (repo: RepoTopology): DropdownRow[] => [
+    { path: repo.root, branch: repo.mainBranch, main: true },
+    ...repo.worktrees.map(wt => ({
+      path: wt.path,
+      ...(wt.branch === undefined ? {} : { branch: wt.branch }),
+      main: false,
+      ...(wt.locked ? { locked: true } : {}),
+      ...(wt.prunable ? { prunable: true } : {}),
+    })),
+  ]
+
   function renderList(filter: string): void {
     listContainer.innerHTML = ''
     const lower = filter.toLowerCase()
@@ -490,39 +468,61 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
 
     let totalShown = 0
 
-    for (const group of loaded) {
-      const filtered = group.worktrees.filter(wt => {
+    for (const repo of targetRepos) {
+      const filtered = rowsOf(repo).filter(row => {
         if (!hasFilter) return true
-        const name = basename(wt.path).toLowerCase()
-        const branch = (wt.branch ?? '').toLowerCase()
-        return name.includes(lower) || branch.includes(lower) || wt.path.toLowerCase().includes(lower)
+        const name = basename(row.path).toLowerCase()
+        const branch = (row.branch ?? '').toLowerCase()
+        return name.includes(lower) || branch.includes(lower) || row.path.toLowerCase().includes(lower)
       })
 
-      if (filtered.length === 0 && group.error === undefined) continue
+      if (filtered.length === 0) continue
       totalShown += filtered.length
 
       const groupEl = el('div', { class: 'dsh-wt-repo-group' })
 
-      if (group.error !== undefined) {
-        groupEl.appendChild(el('div', { class: 'dsh-wt-repo-empty', text: group.error }))
-      }
-      for (const wt of filtered) {
+      for (const row of filtered) {
         const item = el('button', { class: 'dsh-wt-dropdown-item' })
         const info = el('div', { class: 'dsh-wt-dropdown-item-info' })
-        info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-path', text: basename(wt.path), title: wt.path }))
+        info.appendChild(el('div', { class: 'dsh-wt-dropdown-item-path', text: basename(row.path), title: row.path }))
         item.appendChild(info)
         const badges: string[] = []
-        if (wt.bare) badges.push('bare')
-        if (wt.locked) badges.push('locked')
-        if (wt.prunable) badges.push('prunable')
+        if (row.main) badges.push('main')
+        if (row.locked) badges.push('locked')
+        if (row.prunable) badges.push('prunable')
         for (const badge of badges) {
           item.appendChild(el('span', { class: 'dsh-wt-dropdown-item-badge', text: badge }))
+        }
+        // linked worktree 行内嵌移除按钮（hover 显示，stopPropagation 不触发行点击）。
+        if (!row.main) {
+          const removeBtn = el('button', {
+            class: 'dsh-wt-dropdown-item-remove',
+            title: UI.dropdown.remove,
+            text: '×',
+            'aria-label': UI.dropdown.remove,
+          })
+          removeBtn.onclick = async (e: MouseEvent) => {
+            e.stopPropagation()
+            if (!window.confirm(format(UI.dropdown.removeConfirm, { path: row.path }))) return
+            removeBtn.setAttribute('disabled', 'disabled')
+            try {
+              await apiPost<RemoveResponse>('remove', { worktreePath: row.path })
+              // 侧边栏投影与变更视图跟随刷新。
+              window.dispatchEvent(new Event(WORKTREE_REFRESH_EVENT))
+              await reloadTopology()
+            } catch (err) {
+              removeBtn.removeAttribute('disabled')
+              const msg = err instanceof Error ? err.message : String(err)
+              dropdown.appendChild(el('div', { class: 'dsh-wt-dropdown-error', text: msg }))
+            }
+          }
+          item.appendChild(removeBtn)
         }
         item.onclick = async (e: MouseEvent) => {
           e.stopPropagation()
           item.setAttribute('disabled', 'disabled')
           try {
-            await ensureAndSwitchWorkspace(wt.path)
+            await ensureAndSwitchWorkspace(row.path)
             closeDropdown()
           } catch (err) {
             item.removeAttribute('disabled')
@@ -537,27 +537,38 @@ async function showWorktreeDropdown(trigger: HTMLElement): Promise<void> {
     }
 
     if (totalShown === 0) {
-      listContainer.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: '无匹配 worktree' }))
+      listContainer.appendChild(el('div', { class: 'dsh-wt-dropdown-loading', text: UI.dropdown.noMatch }))
     }
+
+    header.textContent = format(UI.dropdown.reposSummary, {
+      repos: targetRepos.length,
+      worktrees: totalShown,
+    })
+  }
+
+  /** 重新拉取拓扑并保持当前筛选重渲染（移除成功后调用）。 */
+  const reloadTopology = async (): Promise<void> => {
+    topology = await apiGet('topology') as TopologyResponse
+    renderList(searchBox.value)
   }
 
   searchBox.oninput = () => renderList(searchBox.value)
   searchBox.onclick = (e: MouseEvent) => e.stopPropagation()
   renderList('')
 
-  // 5. Create-new-worktree row (targets the selected workspace's repo)
+  // 4. Create-new-worktree row (targets the selected workspace's repo)
   const createRow = el('div', { class: 'dsh-wt-dropdown-create' })
   const branchInput = el('input', {
     class: 'dsh-wt-dropdown-input',
-    placeholder: '新分支名 (如 feature/xxx)',
+    placeholder: UI.dropdown.newBranchPlaceholder,
   })
   createRow.appendChild(branchInput)
-  const createBtn = el('button', { class: 'dsh-wt-dropdown-btn', text: '创建' })
+  const createBtn = el('button', { class: 'dsh-wt-dropdown-btn', text: UI.dropdown.create })
   createBtn.onclick = async (e: MouseEvent) => {
     e.stopPropagation()
     const branch = branchInput.value.trim()
     if (!branch) return
-    const repoPath = currentRepoRoot ?? loaded[0].repo.root
+    const repoPath = currentRepoRoot ?? targetRepos[0].root
     createBtn.setAttribute('disabled', 'disabled')
     try {
       const result = await apiPost('create', {
@@ -660,7 +671,6 @@ const WORKTREE_OPTION_LABEL: Record<string, string> = {
   '分组方式': '按工作树',
   'Group by': 'By worktree',
 }
-
 /**
  * 把「按工作树」开关注入官方侧边栏「视图选项」下拉菜单：插入「分组方式」
  * 一组的末尾（按工作区／单列表 之后），选中时显示官方菜单项的勾选图标。
@@ -691,8 +701,8 @@ function injectViewOptionsGroupingItem(): void {
 
     const labelText = (rows[labelIndex].textContent ?? '').trim()
     const labelEl = button.querySelector('span')
-    if (labelEl !== null) labelEl.textContent = WORKTREE_OPTION_LABEL[labelText] ?? '按工作树'
-    button.title = '按工作树聚合会话：隐藏 worktree 独立行，把会话聚合到仓库主行并显示分支'
+    if (labelEl !== null) labelEl.textContent = WORKTREE_OPTION_LABEL[labelText] ?? UI.dropdown.viewOptionLabel
+    button.title = UI.dropdown.viewOptionTitle
 
     // 官方菜单项以末尾的勾选 svg 表示选中，并带一个 selected 类名；
     // 从当前菜单里各取一个选中/未选中行的类名作为切换模板。
@@ -732,9 +742,17 @@ function setupObserver(): void {
   injectWorktreeButton()
   injectViewOptionsGroupingItem()
 
+  // 聊天流式输出期间 mutation 极其密集：把注入扫描合并到每帧最多一次，
+  // 避免每次 mutation 都全量 querySelectorAll 菜单。
+  let frameScheduled = false
   const observer = new MutationObserver(() => {
-    injectWorktreeButton()
-    injectViewOptionsGroupingItem()
+    if (frameScheduled) return
+    frameScheduled = true
+    requestAnimationFrame(() => {
+      frameScheduled = false
+      injectWorktreeButton()
+      injectViewOptionsGroupingItem()
+    })
   })
   observer.observe(document.body, { childList: true, subtree: true })
 }

@@ -10,19 +10,27 @@ export function useTopology(sessionKey: string, workspaceKey: string): SidebarTo
   const [topology, setTopology] = useState<SidebarTopology>({ repos: [] })
   useEffect(() => {
     let active = true
-    const refresh = (): void => {
+    let lastFetch = 0
+    // focus 与刷新事件可能高频触发（切标签页、下拉操作），2 秒内不重复打
+    // 宿主 git 扫描；插件主动派发的刷新事件（force）总是生效。
+    const refresh = (force: boolean): void => {
+      const now = Date.now()
+      if (!force && now - lastFetch < 2000) return
+      lastFetch = now
       void apiGet<SidebarTopology>('topology').then(
         value => { if (active) setTopology(value) },
         () => { if (active) setTopology({ repos: [] }) },
       )
     }
-    refresh()
-    window.addEventListener(WORKTREE_REFRESH_EVENT, refresh)
-    window.addEventListener('focus', refresh)
+    refresh(false)
+    const onRefresh = (): void => { refresh(true) }
+    const onFocus = (): void => { refresh(false) }
+    window.addEventListener(WORKTREE_REFRESH_EVENT, onRefresh)
+    window.addEventListener('focus', onFocus)
     return () => {
       active = false
-      window.removeEventListener(WORKTREE_REFRESH_EVENT, refresh)
-      window.removeEventListener('focus', refresh)
+      window.removeEventListener(WORKTREE_REFRESH_EVENT, onRefresh)
+      window.removeEventListener('focus', onFocus)
     }
   }, [sessionKey, workspaceKey])
   return topology

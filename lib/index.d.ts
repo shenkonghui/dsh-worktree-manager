@@ -9,7 +9,6 @@
  *
  * Routes:
  *   GET  /plugins/dsh-worktree-manager/api/list?repoPath=<path>
- *   GET  /plugins/dsh-worktree-manager/api/repos
  *   GET  /plugins/dsh-worktree-manager/api/topology
  *   GET  /plugins/dsh-worktree-manager/api/changes?path=<dir>
  *   GET  /plugins/dsh-worktree-manager/api/history?path=<dir>&limit=<n>
@@ -18,6 +17,9 @@
  *   POST /plugins/dsh-worktree-manager/api/create   { repoPath, branch, targetPath?, newBranch? }
  *   POST /plugins/dsh-worktree-manager/api/remove   { worktreePath, force? }
  *   POST /plugins/dsh-worktree-manager/api/branches { repoPath }
+ *
+ * `topology` 聚合了仓库发现（原 /api/repos）与各仓库的 worktree 列表，供
+ * 下拉与侧边栏投影一次拉全。POST 写操作校验 Origin 与 Host 同源。
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 /**
@@ -50,6 +52,7 @@ interface Context {
             path: string;
             title: string;
         } | undefined>;
+        delete(id: string): Promise<boolean>;
     };
 }
 /** Cordis plugin name. */
@@ -71,22 +74,33 @@ interface WorktreeInfo {
     /** Whether the worktree is prunable. */
     prunable: boolean;
 }
-/** 每个仓库的侧边栏投影拓扑：分支归属与 workspace 归属。 */
+/** One workspace entry under a discovered repository root. */
+interface RepoWorkspace {
+    /** dsh workspace id. */
+    id: string;
+    /** Workspace directory path (canonicalized at registry create time). */
+    path: string;
+    /** Display title. */
+    title: string;
+}
+/** 每个仓库的侧边栏投影拓扑：分支归属、workspace 归属与合并状态。 */
 interface RepoTopology {
-    /** 规范化 git 仓库根（与 {@link RepoGroup.root} 语义一致）。 */
+    /** 规范化 git 仓库根（主工作树目录）。 */
     root: string;
     /** 展示名（根路径 basename）。 */
     name: string;
     /** 主工作树（path === root）当前分支；detached HEAD 时缺省。 */
     mainBranch?: string;
-    /** 非主 worktree 列表（含各自分支与合并状态）。 */
+    /** 非主 worktree 列表（含各自分支、合并状态与 locked/prunable 徽标）。 */
     worktrees: Array<{
         path: string;
         branch?: string;
         merged?: boolean;
+        locked?: boolean;
+        prunable?: boolean;
     }>;
-    /** 注册在该仓库下的 dsh workspace id（主 + worktree）。 */
-    workspaceIds: string[];
+    /** 注册在该仓库下的 dsh workspace（主 + worktree），id/path/title 齐全。 */
+    workspaces: RepoWorkspace[];
 }
 /**
  * 列出仓库内已完全合并到 baseRef 的本地分支（其 tip 可从 baseRef 到达）。
@@ -102,7 +116,8 @@ export declare function headMergedInto(root: string, baseRef: string, head: stri
 /**
  * 把仓库的 linked worktree 转成拓扑行，并为每行判定 `merged`。基准分支或分支
  * 集合不可用时省略该字段（保持「未知」，客户端维持原有配色）——绝不因为判定
- * 不出来就把 worktree 标成未合并。导出供自检脚本使用。
+ * 不出来就把 worktree 标成未合并。行上还带 locked/prunable 供下拉徽标展示。
+ * 导出供自检脚本使用。
  */
 export declare function worktreeRows(root: string, baseRef: string | undefined, mergedBranches: Set<string> | undefined, linked: Array<{
     path: string;

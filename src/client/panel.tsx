@@ -14,6 +14,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
 import { translate, type WorktreePanelKey } from './locales'
+import { apiGet, basename, type RepoTopology, type TopologyResponse } from './api.js'
 
 // ---- Minimal runtime types (no dsh build-time dependency) ----
 
@@ -68,46 +69,7 @@ export interface WorktreePanelProps {
   t: (key: WorktreePanelKey, params?: Record<string, string | number>) => string
 }
 
-// ---- API types (matching the host half) ----
-
-/** One discovered repository root with its registered dsh workspaces. */
-interface RepoGroup {
-  root: string
-  name: string
-  workspaces: { id: string; path: string; title: string }[]
-}
-
-/** Response from GET /api/repos. */
-interface ReposResponse {
-  repos: RepoGroup[]
-}
-
-/** One git worktree row from GET /api/list. */
-interface WorktreeInfo {
-  path: string
-  head: string
-  branch?: string
-  bare: boolean
-  locked: boolean
-  prunable: boolean
-}
-
-/** Response from GET /api/list. */
-interface ListResponse {
-  worktrees: WorktreeInfo[]
-}
-
-// ---- API helpers ----
-
-const API_BASE = '/plugins/dsh-worktree-manager/api/'
-
-async function apiGet<T>(action: string, params: Record<string, string>): Promise<T> {
-  const qs = new URLSearchParams(params).toString()
-  const res = await fetch(`${API_BASE}${action}?${qs}`)
-  const json = await res.json() as T & { error?: string }
-  if (!res.ok) throw new Error(json.error ?? `HTTP ${res.status}`)
-  return json
-}
+// ---- API types (matching the host half, shared via ./api.js) ----
 
 // ---- Grouping logic ----
 
@@ -143,12 +105,6 @@ interface GroupTree {
 /** UNGROUPED_KEY for sessions whose workspace is not inside any git worktree. */
 const UNGROUPED_KEY = '__ungrouped__'
 
-/** Extract the final path component (trailing slashes trimmed). */
-function basename(p: string): string {
-  const parts = p.replace(/\/+$/, '').split('/')
-  return parts[parts.length - 1] || p
-}
-
 /**
  * Derive a two-level group tree from sessions, workspaces, and repo/worktree
  * data.
@@ -163,8 +119,8 @@ function deriveGroupTree(
   sessions: SessionListState,
   workspaces: readonly WorkspaceItem[],
   archived: readonly string[],
-  repos: readonly RepoGroup[],
-  worktreesByRepo: ReadonlyMap<string, WorktreeInfo[]>,
+  repos: readonly { root: string; name: string }[],
+  worktreesByRepo: ReadonlyMap<string, readonly { path: string }[]>,
 ): GroupTree {
   const archivedSet = new Set(archived)
 
@@ -174,7 +130,6 @@ function deriveGroupTree(
   for (const repo of repos) {
     const wts = worktreesByRepo.get(repo.root) ?? []
     for (const wt of wts) {
-      if (wt.bare) continue
       allWorktrees.push({ path: wt.path, label: basename(wt.path), repoRoot: repo.root })
     }
   }
@@ -490,7 +445,7 @@ const errorNote: CSSProperties = {
 type FetchState =
   | { phase: 'loading' }
   | { phase: 'error'; message: string }
-  | { phase: 'ready'; repos: RepoGroup[]; worktreesByRepo: Map<string, WorktreeInfo[]> }
+  | { phase: 'ready'; repos: RepoTopology[]; worktreesByRepo: Map<string, { path: string }[]> }
   | { phase: 'empty' }
 
 /**
@@ -517,26 +472,21 @@ export function WorktreePanel({ wide, useWorkspaces, useSessions, openSession, t
     let cancelled = false
     void (async () => {
       try {
-        const reposRes = await apiGet<ReposResponse>('repos', {})
+        // 一次 /api/topology 拉全仓库与各仓库 worktree 行（合并了原 repos+list）。
+        const topoRes = await apiGet<TopologyResponse>('topology', {})
         if (cancelled) return
-        if (reposRes.repos.length === 0) {
+        if (topoRes.repos.length === 0) {
           setFetchState({ phase: 'empty' })
           return
         }
-        const worktreesByRepo = new Map<string, WorktreeInfo[]>()
-        await Promise.all(
-          reposRes.repos.map(async (repo) => {
-            try {
-              const listRes = await apiGet<ListResponse>('list', { repoPath: repo.root })
-              if (!cancelled) worktreesByRepo.set(repo.root, listRes.worktrees)
-            } catch {
-              // Per-repo failure leaves that repo with no worktrees; the
-              // grouping falls back to ungrouped for its workspaces.
-            }
-          }),
-        )
+        const worktreesByRepo = new Map<string, { path: string }[]>()
+        for (const repo of topoRes.repos) {
+          // 合成主工作树行（= 仓库根）：topology 只列 linked worktree，
+          // 主仓库会话仍要挂在仓库名子组下。
+          worktreesByRepo.set(repo.root, [{ path: repo.root }, ...repo.worktrees.map(wt => ({ path: wt.path }))])
+        }
         if (cancelled) return
-        setFetchState({ phase: 'ready', repos: reposRes.repos, worktreesByRepo })
+        setFetchState({ phase: 'ready', repos: topoRes.repos, worktreesByRepo })
       } catch (err) {
         if (cancelled) return
         const message = err instanceof Error ? err.message : String(err)
