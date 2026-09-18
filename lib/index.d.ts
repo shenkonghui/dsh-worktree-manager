@@ -12,7 +12,7 @@
  *   GET  /plugins/dsh-worktree-manager/api/topology
  *   GET  /plugins/dsh-worktree-manager/api/changes?path=<dir>
  *   GET  /plugins/dsh-worktree-manager/api/history?path=<dir>&limit=<n>
- *   GET  /plugins/dsh-worktree-manager/api/commit?path=<dir>&hash=<sha>
+ *   GET  /plugins/dsh-worktree-manager/api/commit?path=<dir>&hash=<sha>[&sub=<rel>]
  *   GET  /plugins/dsh-worktree-manager/api/diff?path=<dir>&file=<rel>[&sub=<rel>][&hash=<sha>]
  *   POST /plugins/dsh-worktree-manager/api/create   { repoPath, branch, targetPath?, newBranch? }
  *   POST /plugins/dsh-worktree-manager/api/remove   { worktreePath, force? }
@@ -162,6 +162,20 @@ interface DiffRow {
  * (plus `<origPath>` NUL for renames/copies). Exported for the self-check script.
  */
 export declare function parseDiffTree(out: string): DiffRow[];
+/** Response body for the commit detail route. */
+interface CommitDetailResponse {
+    files: ChangeFile[];
+    /** Submodule pointer changes with the submodule commits between the two pointers. */
+    submodules: Array<{
+        path: string;
+        name: string;
+        commits: string[];
+    }>;
+}
+/** Commit detail: changed files plus, for submodule pointer changes, the submodule commits in between.
+ *  With `sub`, `hash` refers to a commit inside that submodule — return its changed files instead.
+ *  Exported for the self-check script. */
+export declare function handleCommitDetail(query: Record<string, string>): Promise<CommitDetailResponse>;
 /** Plugin entry: register HTTP routes for the worktree management API. */
 export declare function apply(ctx: Context): Promise<void>;
 export {};

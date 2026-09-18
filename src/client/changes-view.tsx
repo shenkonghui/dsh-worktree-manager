@@ -320,6 +320,17 @@ const commitLine: CSSProperties = {
   color: TOKEN('--dsw-alias-label-secondary', 'inherit'),
 }
 
+/** 子模块提交行：可点击展开该提交的变更文件。 */
+function commitLineStyle(selected: boolean): CSSProperties {
+  return {
+    ...commitLine,
+    cursor: 'pointer',
+    borderRadius: '4px',
+    padding: '0 4px',
+    background: selected ? TOKEN('--dsw-alias-bg-l2', 'rgba(0,0,0,0.05)') : 'transparent',
+  }
+}
+
 // ---- Component ----
 
 /** 相对时间：分钟/小时/天前，超过 30 天显示日期。 */
@@ -420,13 +431,42 @@ function WorktreeDetail(props: {
   )
 }
 
-/** commit 明细：变更文件 + 子模块指针变动（列出指针扫过的子模块提交）。 */
+/** commit 明细：变更文件 + 子模块指针变动（列出指针扫过的子模块提交，点击可展开其变更文件）。 */
 function CommitDetail(props: {
+  /** 会话 cwd，用于拉取子模块提交的文件列表。 */
+  path?: string
   detail: CommitDetailResponse
   hash: string
   selected: FileSelection | null
   onSelect: (file: FileSelection) => void
 }): JSX.Element {
+  const [subCommit, setSubCommit] = useState<{ sub: string; hash: string } | null>(null)
+  const [subDetail, setSubDetail] = useState<FetchState<CommitDetailResponse>>({ phase: 'loading' })
+
+  // 选中的子模块提交：拉取其变更文件；文件行点击复用 /api/diff 的 sub+hash 通道。
+  const path = props.path
+  useEffect(() => {
+    if (subCommit === null || path === undefined) return
+    let cancelled = false
+    setSubDetail({ phase: 'loading' })
+    void (async () => {
+      try {
+        const data = await apiGet<CommitDetailResponse>('commit', {
+          path,
+          hash: subCommit.hash,
+          sub: subCommit.sub,
+        })
+        if (!cancelled) setSubDetail({ phase: 'ready', data })
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err)
+          setSubDetail({ phase: 'error', message })
+        }
+      }
+    })()
+    return () => { cancelled = true }
+  }, [path, subCommit])
+
   return (
     <>
       {props.detail.files.length > 0 && (
@@ -442,12 +482,34 @@ function CommitDetail(props: {
             {sub.commits.length > 0
               ? (
                 <ul style={list}>
-                  {sub.commits.map(line => (
-                    <li key={line} style={commitLine}>{line}</li>
-                  ))}
+                  {sub.commits.map(line => {
+                    const hash = line.slice(0, line.indexOf(' '))
+                    const active = subCommit !== null && subCommit.sub === sub.path && subCommit.hash === hash
+                    return (
+                      <li
+                        key={line}
+                        style={commitLineStyle(active)}
+                        title={UI.changes.subCommitHint}
+                        onClick={() => { setSubCommit(prev => (active ? null : { sub: sub.path, hash })) }}
+                      >
+                        {line}
+                      </li>
+                    )
+                  })}
                 </ul>
               )
               : <p style={note}>{UI.changes.subUnavailable}</p>}
+            {subCommit !== null && subCommit.sub === sub.path && (
+              <div style={detailBox}>
+                {subDetail.phase === 'loading' && <p style={note}>{UI.changes.loading}</p>}
+                {subDetail.phase === 'error' && <p style={errorNote}>{UI.changes.error}：{subDetail.message}</p>}
+                {subDetail.phase === 'ready' && (
+                  subDetail.data.files.length > 0
+                    ? <FileRows files={subDetail.data.files} sub={subCommit.sub} hash={subCommit.hash} selected={props.selected} onSelect={props.onSelect} />
+                    : <p style={note}>{UI.changes.noChanges}</p>
+                )}
+              </div>
+            )}
           </div>
         </div>
       ))}
@@ -612,7 +674,7 @@ export function ChangesView(props: { sessionId?: string }): JSX.Element | null {
                     {commitDetail.phase === 'loading' && <p style={note}>{UI.changes.loading}</p>}
                     {commitDetail.phase === 'error' && <p style={errorNote}>{UI.changes.error}：{commitDetail.message}</p>}
                     {commitDetail.phase === 'ready' && (
-                      <CommitDetail detail={commitDetail.data} hash={commit.hash} selected={selectedFile} onSelect={setSelectedFile} />
+                      <CommitDetail path={cwd} detail={commitDetail.data} hash={commit.hash} selected={selectedFile} onSelect={setSelectedFile} />
                     )}
                   </div>
                 )}

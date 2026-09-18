@@ -32,7 +32,7 @@ A Cordis plugin that injects `ctx.webServer`, `ctx.shell`, and `ctx.workspaceReg
 | GET | `/api/topology` | Per-repo branch/workspace topology (repo discovery + worktree lists + merge status in one scan) |
 | GET | `/api/changes?path=<dir>` | Working-tree changes of the containing repo, recursing into submodules |
 | GET | `/api/history?path=<dir>&limit=<n>` | Commit history of the containing worktree, newest first |
-| GET | `/api/commit?path=<dir>&hash=<sha>` | One commit's changed files; submodule pointer moves list the submodule commits in between |
+| GET | `/api/commit?path=<dir>&hash=<sha>[&sub=<rel>]` | One commit's changed files; submodule pointer moves list the submodule commits in between. With `sub`, `hash` refers to a commit inside that submodule |
 | GET | `/api/diff?path=<dir>&file=<rel>[&sub=<rel>][&hash=<sha>]` | Unified diff of one file (working tree vs HEAD, or one commit) |
 | POST | `/api/create` | Create a new worktree and register it as a workspace |
 | POST | `/api/remove` | Remove a git worktree and unregister its dsh workspace |
@@ -193,9 +193,9 @@ Returns `{ root, branch?, commits: [{ hash, subject, author, date }] }` (date = 
 
 ### `GET /plugins/dsh-worktree-manager/api/commit`
 
-Query parameters: `path` (required), `hash` (required, commit hash)
+Query parameters: `path` (required), `hash` (required, commit hash), `sub` (optional, submodule path relative to the worktree root)
 
-Returns one commit's changed files. Submodule pointer rows become `submodules` entries listing the submodule commits between the old and new pointer (`git -C <submodule> log old..new`).
+Returns one commit's changed files. Submodule pointer rows become `submodules` entries listing the submodule commits between the old and new pointer (`git -C <submodule> log old..new`). With `sub`, `hash` refers to a commit inside that submodule instead — the handler runs `git diff-tree` inside the submodule and returns only that commit's `files` (empty `submodules`).
 
 ```json
 {

@@ -11,7 +11,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { parseDiffTree, parseStatusPorcelainV2, parseSubmoduleStatus } from '../lib/index.js'
+import { handleCommitDetail, parseDiffTree, parseStatusPorcelainV2, parseSubmoduleStatus } from '../lib/index.js'
 
 const GIT_ENV = {
   ...process.env,
@@ -90,5 +90,24 @@ try {
   pseudoDiff = String(err.stdout ?? '')
 }
 assert.match(pseudoDiff, /\+untracked/)
+
+// Submodule commit detail (`sub` parameter): the handler runs diff-tree inside
+// the submodule and returns the files that submodule commit changed. The
+// pointer-update commit above lists the "subchange" commit in between.
+const pointerHash = git(main, ['rev-parse', 'HEAD']).trim()
+const commitDetail = await handleCommitDetail({ path: main, hash: pointerHash })
+assert.equal(commitDetail.files.length, 0)
+assert.equal(commitDetail.submodules.length, 1)
+assert.equal(commitDetail.submodules[0].path, 'sub')
+assert.equal(commitDetail.submodules[0].commits.length, 1)
+const subCommitSha = commitDetail.submodules[0].commits[0].split(' ')[0]
+const subDetail = await handleCommitDetail({ path: main, hash: subCommitSha, sub: 'sub' })
+assert.deepEqual(subDetail.files, [{ code: 'M', path: 'a.txt' }])
+assert.equal(subDetail.submodules.length, 0)
+
+// The file-diff channel for that submodule commit: `git show <sha> -- <file>`
+// inside the submodule (the /api/diff sub+hash path).
+const subFileDiff = git(subWt, ['show', '--format=', subCommitSha, '--', 'a.txt'])
+assert.match(subFileDiff, /\+changed/)
 
 console.log('changes self-check: OK')
